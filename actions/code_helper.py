@@ -14,6 +14,7 @@
 import subprocess
 import sys
 import json
+import base64
 import re
 import time
 from pathlib import Path
@@ -37,9 +38,8 @@ def _get_api_key() -> str:
 
 
 def _get_gemini(model: str = GEMINI_MODEL):
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(model)
+    from or_client import ClaudeModelShim
+    return ClaudeModelShim(model_name=model)
 
 
 def _clean_code(text: str) -> str:
@@ -455,11 +455,7 @@ def _screen_debug_action(description, file_path, player, speak=None) -> str:
             print(f"[Code] ⚠️ Could not read file: {err}")
 
     try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=_get_api_key())
-
+        from or_client import client as _claude_client
         image_bytes  = screenshot_path.read_bytes()
         image_base64 = _image_to_base64(screenshot_path)
 
@@ -481,17 +477,8 @@ Please:
 
 Be specific and actionable. If you see an error message, quote it exactly."""
 
-        contents = [
-            types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-            analysis_prompt,
-        ]
-
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=contents,
-        )
-
-        analysis = response.text.strip()
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        analysis = _claude_client.vision(analysis_prompt, image_b64, mime="image/png").strip()
         print(f"[Code] ✅ Screen analysis complete")
 
         try:

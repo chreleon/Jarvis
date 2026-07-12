@@ -178,13 +178,8 @@ def _get_api_key() -> str:
 
 
 def create_plan(goal: str, context: str = "") -> dict:
-    import google.generativeai as genai
-
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
-        system_instruction=PLANNER_PROMPT
-    )
+    from or_client import ClaudeModelShim
+    model = ClaudeModelShim(model_name="claude-haiku-4-5-20251001", system_instruction=PLANNER_PROMPT)
 
     user_input = f"Goal: {goal}"
     if context:
@@ -238,13 +233,8 @@ def _fallback_plan(goal: str) -> dict:
 
 
 def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> dict:
-    import google.generativeai as genai
-
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash",
-        system_instruction=PLANNER_PROMPT
-    )
+    from or_client import ClaudeModelShim
+    model = ClaudeModelShim(model_name="claude-sonnet-5", system_instruction=PLANNER_PROMPT)
 
     completed_summary = "\n".join(
         f"  - Step {s['step']} ({s['tool']}): DONE" for s in completed_steps

@@ -22,7 +22,7 @@ def config_exists() -> bool:
     return CONFIG_FILE.exists()
 
 
-def save_api_keys(gemini_api_key: str) -> None:
+def save_api_keys(gemini_api_key: str = "", anthropic_api_key: str = "") -> None:
     ensure_config_dir()
 
     data: dict = {}
@@ -32,7 +32,10 @@ def save_api_keys(gemini_api_key: str) -> None:
         except Exception:
             data = {}
 
-    data["gemini_api_key"] = gemini_api_key.strip()
+    if gemini_api_key:
+        data["gemini_api_key"] = gemini_api_key.strip()
+    if anthropic_api_key:
+        data["anthropic_api_key"] = anthropic_api_key.strip()
 
     CONFIG_FILE.write_text(
         json.dumps(data, indent=2),
@@ -54,6 +57,13 @@ def get_gemini_key() -> str | None:
     return load_api_keys().get("gemini_api_key")
 
 
+def get_anthropic_key() -> str | None:
+    return load_api_keys().get("anthropic_api_key")
+
+
 def is_configured() -> bool:
-    key = get_gemini_key()
-    return bool(key and len(key) > 15)
+    # Gemini is still needed for the live voice loop (main.py / screen_processor.py);
+    # Anthropic is needed for everything else (planning, code help, file processing, etc.)
+    gemini_key    = get_gemini_key()
+    anthropic_key = get_anthropic_key()
+    return bool(gemini_key and len(gemini_key) > 15) and bool(anthropic_key and len(anthropic_key) > 15)

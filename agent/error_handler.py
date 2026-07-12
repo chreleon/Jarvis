@@ -78,8 +78,6 @@ def analyze_error(
             "user_message": str
         }
     """
-    import google.generativeai as genai
-
     if attempt >= max_attempts:
         print(f"[ErrorHandler] ⚠️ Max attempts reached for step {step.get('step')} — forcing replan")
         return {
@@ -90,11 +88,8 @@ def analyze_error(
             "user_message":  "Trying a different approach, sir."
         }
 
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash-lite",
-        system_instruction=ERROR_ANALYST_PROMPT
-    )
+    from or_client import ClaudeModelShim
+    model = ClaudeModelShim(model_name="claude-haiku-4-5-20251001", system_instruction=ERROR_ANALYST_PROMPT)
 
     prompt = f"""Failed step:
 Tool: {step.get('tool')}
@@ -148,10 +143,8 @@ def generate_fix(step: dict, error: str, fix_suggestion: str) -> dict:
 
     Returns a modified step dict.
     """
-    import google.generativeai as genai
-
-    genai.configure(api_key=_get_api_key())
-    model = genai.GenerativeModel(model_name="gemini-2.0-flash")
+    from or_client import ClaudeModelShim
+    model = ClaudeModelShim(model_name="claude-sonnet-5")
 
     prompt = f"""A task step failed. Generate a replacement step.
 

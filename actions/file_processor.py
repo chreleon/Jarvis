@@ -25,8 +25,6 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
-import google.generativeai as genai
-
 
 def _get_api_key() -> str:
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
@@ -35,8 +33,8 @@ def _get_api_key() -> str:
 
 
 def _gemini_client():
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel("gemini-2.5-flash")
+    from or_client import ClaudeModelShim
+    return ClaudeModelShim(model_name="claude-sonnet-5")
 
 
 def _detect_type(path: Path) -> str:

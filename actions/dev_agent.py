@@ -25,9 +25,8 @@ def _get_api_key() -> str:
 
 
 def _get_model(model_name: str):
-    import google.generativeai as genai
-    genai.configure(api_key=_get_api_key())
-    return genai.GenerativeModel(model_name)
+    from or_client import ClaudeModelShim
+    return ClaudeModelShim(model_name=model_name)
 
 
 def _strip_fences(text: str) -> str:

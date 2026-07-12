@@ -912,11 +912,11 @@ class SetupOverlay(QWidget):
         layout.addWidget(self._key_input)
         layout.addSpacing(8)
 
-        layout.addWidget(_lbl("OPENROUTER API KEY", 8, color=C.TEXT_DIM,
+        layout.addWidget(_lbl("ANTHROPIC API KEY", 8, color=C.TEXT_DIM,
                        align=Qt.AlignmentFlag.AlignLeft))
         self._or_input = QLineEdit()
         self._or_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._or_input.setPlaceholderText("sk-or-…")
+        self._or_input.setPlaceholderText("sk-ant-…")
         self._or_input.setFont(QFont("Courier New", 10))
         self._or_input.setFixedHeight(32)
         self._or_input.setStyleSheet(f"""
@@ -1443,7 +1443,7 @@ class MainWindow(QMainWindow):
         try:
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
             return (bool(d.get("gemini_api_key")) and
-                    bool(d.get("openrouter_api_key")) and
+                    bool(d.get("anthropic_api_key")) and
                     bool(d.get("os_system")))
         except Exception:
             return False
@@ -1462,12 +1462,12 @@ class MainWindow(QMainWindow):
         self._overlay = ov
 
     # Change signature:
-    def _on_setup_done(self, key: str, or_key: str, os_name: str):
+    def _on_setup_done(self, key: str, anthropic_key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         API_FILE.write_text(
             json.dumps({
                 "gemini_api_key":    key,
-                "openrouter_api_key": or_key,
+                "anthropic_api_key": anthropic_key,
                 "os_system":         os_name,
             }, indent=4),
             encoding="utf-8",

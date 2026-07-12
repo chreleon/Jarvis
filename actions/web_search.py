@@ -19,23 +19,14 @@ def _get_api_key() -> str:
 
 
 def _gemini_search(query: str) -> str:
-    from google import genai
+    # Note: Claude's API has no built-in Google Search grounding tool like
+    # Gemini did, so this now asks Claude directly. The DuckDuckGo fallback
+    # path below still provides real web results when that matters more.
+    from or_client import client as _claude_client
 
-    client   = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=query,
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
-
-    text = text.strip()
+    text = _claude_client.chat(query).strip()
     if not text:
-        raise ValueError("Gemini returned an empty response.")
+        raise ValueError("Claude returned an empty response.")
     return text
 
 
