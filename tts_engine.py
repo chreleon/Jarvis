@@ -14,8 +14,8 @@ from pathlib import Path
 
 # Path to the downloaded Piper voice model (.onnx) and its .onnx.json config.
 # Download once via: https://github.com/rhasspy/piper/releases
-# A calm, clear voice suits a "Jarvis" style assistant, e.g. en_US-ryan-medium
-PIPER_VOICE_MODEL = Path(__file__).resolve().parent / "voices" / "en_US-ryan-medium.onnx"
+# British male voice for a proper "Jarvis" accent -- calm, clear, RP-leaning.
+PIPER_VOICE_MODEL = Path(__file__).resolve().parent / "voices" / "en_GB-alan-medium.onnx"
 PIPER_EXECUTABLE  = "piper"   # assumes `pip install piper-tts` put this on PATH
 
 OUTPUT_SAMPLE_RATE = 22050    # Piper's default output rate
