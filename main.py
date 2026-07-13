@@ -3,11 +3,13 @@ import threading
 import json
 import sys
 import traceback
+import numpy as np
 from pathlib import Path
 
 import sounddevice as sd
-from google import genai
-from google.genai import types
+from or_client import client as brain_client
+from stt_engine import transcribe_pcm16
+from tts_engine import synthesize_to_pcm, OUTPUT_SAMPLE_RATE
 from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
@@ -42,16 +44,20 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-2.5-flash-native-audio-preview-12-2025"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
-RECEIVE_SAMPLE_RATE = 24000
+RECEIVE_SAMPLE_RATE = OUTPUT_SAMPLE_RATE
 CHUNK_SIZE          = 1024
+
+SILENCE_RMS_THRESHOLD = 400
+SILENCE_HANG_MS        = 900
+MIN_UTTERANCE_MS       = 300
 
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+        data = json.load(f)
+        return data.get("groq_api_key", data.get("gemini_api_key", ""))
 
 
 def _load_system_prompt() -> str:
@@ -495,25 +501,18 @@ TOOL_DECLARATIONS = [
 class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
-        self.ui             = ui
-        self.session        = None
-        self.audio_in_queue = None
-        self.out_queue      = None
-        self._loop          = None
-        self._is_speaking   = False
-        self._speaking_lock = threading.Lock()
+        self.ui              = ui
+        self.audio_out_queue = None
+        self._loop           = None
+        self._is_speaking    = False
+        self._speaking_lock  = threading.Lock()
+        self.conversation    = []
         self.ui.on_text_command = self._on_text_command
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        asyncio.run_coroutine_threadsafe(self._handle_utterance(text), self._loop)
 
     def set_speaking(self, value: bool):
         with self._speaking_lock:
@@ -524,22 +523,25 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
+        if not text or not self._loop:
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
-        )
+        asyncio.run_coroutine_threadsafe(self._speak_async(text), self._loop)
+
+    async def _speak_async(self, text: str):
+        self.ui.write_log(f"Jarvis: {text}")
+        try:
+            pcm = await asyncio.to_thread(synthesize_to_pcm, text)
+            if pcm:
+                await self.audio_out_queue.put(pcm)
+        except Exception as e:
+            print(f"[JARVIS] ❌ TTS: {e}")
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
-    def _build_config(self) -> types.LiveConnectConfig:
+    def _build_system_prompt(self) -> str:
         from datetime import datetime
 
         memory     = load_memory()
@@ -558,26 +560,18 @@ class JarvisLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
-
-        return types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            input_audio_transcription={},
-            system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
-            session_resumption=types.SessionResumptionConfig(),
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Charon"
-                    )
-                )
-            ),
+        parts.append(
+            "\n[TOOLS]\nYou have tools available. To call one, respond with "
+            "ONLY a JSON object of the form "
+            '{"tool_call": {"name": "<tool_name>", "args": {...}}}. '
+            "To just speak to the user, respond with plain text (no JSON). "
+            "Available tools:\n" + json.dumps(TOOL_DECLARATIONS, indent=2)
         )
 
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
-        name = fc.name
-        args = dict(fc.args or {})
+        return "\n".join(parts)
+
+    async def _execute_tool(self, name: str, args: dict) -> str:
+        args = dict(args or {})
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -590,10 +584,7 @@ class JarvisLive:
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": "ok", "silent": True}
-            )
+            return "__SILENT__"
 
         loop   = asyncio.get_event_loop()
         result = "Done."
@@ -706,28 +697,52 @@ class JarvisLive:
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
 
-        return types.FunctionResponse(
-            id=fc.id, name=name,
-            response={"result": result}
-        )
-
-    async def _send_realtime(self):
-        while True:
-            msg = await self.out_queue.get()
-            await self.session.send_realtime_input(media=msg)
+        return result
 
     async def _listen_audio(self):
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        frame_ms               = int(1000 * CHUNK_SIZE / SEND_SAMPLE_RATE)
+        silence_frames_needed  = max(1, SILENCE_HANG_MS // frame_ms)
+        min_frames             = max(1, MIN_UTTERANCE_MS // frame_ms)
+
+        buffer          = bytearray()
+        silence_run     = 0
+        heard_any_voice = False
+
         def callback(indata, frames, time_info, status):
+            nonlocal buffer, silence_run, heard_any_voice
+
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
-            if not jarvis_speaking and not self.ui.muted:
-                data = indata.tobytes()
+            if jarvis_speaking or self.ui.muted:
+                return
+
+            data = indata.tobytes()
+            rms  = float(np.sqrt(np.mean(np.square(indata.astype(np.float32)))))
+
+            if rms >= SILENCE_RMS_THRESHOLD:
+                buffer.extend(data)
+                silence_run     = 0
+                heard_any_voice = True
+            elif heard_any_voice:
+                buffer.extend(data)
+                silence_run += 1
+
+            frames_recorded = len(buffer) // 2 // CHANNELS
+            turn_finished = (
+                heard_any_voice
+                and silence_run >= silence_frames_needed
+                and frames_recorded >= min_frames
+            )
+            if turn_finished:
+                utterance = bytes(buffer)
+                buffer.clear()
+                silence_run     = 0
+                heard_any_voice = False
                 loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
+                    lambda u=utterance: asyncio.ensure_future(self._handle_audio_utterance(u))
                 )
 
         try:
@@ -745,69 +760,110 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
-    async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
-        out_buf, in_buf = [], []
+    async def _handle_audio_utterance(self, pcm_bytes: bytes):
+        try:
+            self.ui.set_state("THINKING")
+            text = await asyncio.to_thread(transcribe_pcm16, pcm_bytes, SEND_SAMPLE_RATE)
+            text = (text or "").strip()
+            if not text:
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+                return
+            self.ui.write_log(f"You: {text}")
+            await self._handle_utterance(text)
+        except Exception as e:
+            print(f"[JARVIS] ❌ STT: {e}")
+            traceback.print_exc()
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+
+    async def _handle_utterance(self, text: str):
+        self.ui.set_state("THINKING")
+        self.conversation.append({"role": "user", "content": text})
 
         try:
-            while True:
-                async for response in self.session.receive():
-
-                    if response.data:
-                        self.audio_in_queue.put_nowait(response.data)
-
-                    if response.server_content:
-                        sc = response.server_content
-
-                        if sc.output_transcription and sc.output_transcription.text:
-                            self.set_speaking(True)
-                            txt = sc.output_transcription.text.strip()
-                            if txt:
-                                out_buf.append(txt)
-
-                        if sc.input_transcription and sc.input_transcription.text:
-                            txt = sc.input_transcription.text.strip()
-                            if txt:
-                                in_buf.append(txt)
-
-                        if sc.turn_complete:
-                            self.set_speaking(False)
-
-                            full_in = " ".join(in_buf).strip()
-                            if full_in:
-                                self.ui.write_log(f"You: {full_in}")
-                            in_buf = []
-
-                            full_out = " ".join(out_buf).strip()
-                            if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
-                            out_buf = []
-
-                            if full_in and len(full_in) > 5:
-                                threading.Thread(
-                                    target=_update_memory_async,
-                                    args=(full_in, full_out),
-                                    daemon=True
-                                ).start()
-
-                    if response.tool_call:
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
-
+            system_prompt = self._build_system_prompt()
+            reply = await asyncio.to_thread(
+                brain_client.multi_turn,
+                [{"role": "system", "content": system_prompt}] + self.conversation[-20:],
+            )
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
-            raise
+            print(f"[JARVIS] ❌ Brain: {e}")
+            self.speak("Sir, I had trouble reaching my reasoning engine just now.")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return
+
+        self.conversation.append({"role": "assistant", "content": reply})
+
+        tool_name, tool_args = self._parse_tool_call(reply)
+
+        if tool_name:
+            print(f"[JARVIS] 📞 {tool_name}")
+            result = await self._execute_tool(tool_name, tool_args)
+            if result == "__SILENT__":
+                pass
+            else:
+                self.conversation.append({
+                    "role": "user",
+                    "content": f"[TOOL RESULT for {tool_name}]: {result}\n"
+                               f"Now reply to the user naturally in one or two sentences."
+                })
+                try:
+                    system_prompt = self._build_system_prompt()
+                    followup = await asyncio.to_thread(
+                        brain_client.multi_turn,
+                        [{"role": "system", "content": system_prompt}] + self.conversation[-20:],
+                    )
+                    self.conversation.append({"role": "assistant", "content": followup})
+                    self.speak(followup)
+                except Exception as e:
+                    print(f"[JARVIS] ❌ Brain (followup): {e}")
+                    self.speak(str(result)[:150])
+
+            threading.Thread(
+                target=_update_memory_async,
+                args=(text, str(tool_name)),
+                daemon=True
+            ).start()
+        else:
+            self.speak(reply)
+            if len(text) > 5:
+                threading.Thread(
+                    target=_update_memory_async,
+                    args=(text, reply),
+                    daemon=True
+                ).start()
+
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+
+    @staticmethod
+    def _parse_tool_call(reply: str):
+        cleaned = reply.strip()
+        if cleaned.startswith("```"):
+            parts = cleaned.split("```")
+            cleaned = parts[1] if len(parts) > 1 else cleaned
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+        cleaned = cleaned.strip()
+
+        if not cleaned.startswith("{"):
+            return None, None
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None, None
+
+        call = data.get("tool_call")
+        if not call or not isinstance(call, dict):
+            return None, None
+
+        return call.get("name"), call.get("args", {})
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
-        loop = asyncio.get_event_loop()
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
@@ -818,9 +874,10 @@ class JarvisLive:
         stream.start()
         try:
             while True:
-                chunk = await self.audio_in_queue.get()
+                chunk = await self.audio_out_queue.get()
                 self.set_speaking(True)
                 await asyncio.to_thread(stream.write, chunk)
+                self.set_speaking(False)
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
@@ -830,43 +887,30 @@ class JarvisLive:
             stream.close()
 
     async def run(self):
-        client = genai.Client(
-            api_key=_get_api_key(),
-            http_options={"api_version": "v1beta"}
-        )
-
         while True:
             try:
-                print("[JARVIS] 🔌 Connecting...")
+                print("[JARVIS] Starting local voice pipeline (Whisper + Groq + Piper)...")
                 self.ui.set_state("THINKING")
-                config = self._build_config()
+                self._loop           = asyncio.get_event_loop()
+                self.audio_out_queue = asyncio.Queue()
 
-                async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
-                    asyncio.TaskGroup() as tg,
-                ):
-                    self.session        = session
-                    self._loop          = asyncio.get_event_loop()
-                    self.audio_in_queue = asyncio.Queue()
-                    self.out_queue      = asyncio.Queue(maxsize=10)
+                print("[JARVIS] Ready.")
+                self.ui.set_state("LISTENING")
+                self.ui.write_log("SYS: JARVIS online (local voice pipeline).")
 
-                    print("[JARVIS] ✅ Connected.")
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
-
-                    tg.create_task(self._send_realtime())
+                async with asyncio.TaskGroup() as tg:
                     tg.create_task(self._listen_audio())
-                    tg.create_task(self._receive_audio())
                     tg.create_task(self._play_audio())
-                    
+
             except Exception as e:
-                print(f"[JARVIS] ⚠️ {e}")
+                print(f"[JARVIS] Error: {e}")
                 traceback.print_exc()
 
             self.set_speaking(False)
             self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
+            print("[JARVIS] Restarting voice pipeline in 3s...")
             await asyncio.sleep(3)
+
 
 def main():
     ui = JarvisUI("face.png")
