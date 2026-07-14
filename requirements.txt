@@ -21,3 +21,5 @@ pyaudio
 groq
 faster-whisper
 piper-tts
+composio-core
+composio-openai
