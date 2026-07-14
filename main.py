@@ -33,6 +33,7 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from composio_agent            import run_agentic_task
 
 
 def get_base_dir():
@@ -387,6 +388,25 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "composio_action",
+        "description": (
+            "Performs a real action on the user's connected GitHub, Gmail, or Google "
+            "Calendar account -- e.g. check repos, star a repo, read/send email, "
+            "check or create calendar events. Use this whenever the user asks about "
+            "or wants to act on GitHub, Gmail, or their calendar."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "request": {
+                    "type": "STRING",
+                    "description": "Plain-language description of what to check or do, e.g. 'star my Jarvis repo' or 'what's on my calendar tomorrow'"
+                }
+            },
+            "required": ["request"]
+        }
+    },
+    {
     "name": "file_processor",
     "description": (
         "Processes any file that the user has uploaded or dropped onto the interface. "
@@ -683,6 +703,12 @@ class JeevesLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+            elif name == "composio_action":
+                r = await loop.run_in_executor(
+                    None, lambda: run_agentic_task(args.get("request", ""))
+                )
+                result = r or "Done."
+
             elif name == "shutdown_jeeves":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
