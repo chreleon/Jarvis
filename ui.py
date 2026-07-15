@@ -28,6 +28,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QProgressBar,
 )
 
+import voice_downloader
+import composio_connect
+
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
@@ -941,6 +944,55 @@ class SetupOverlay(QWidget):
         self._sel(detected)
         layout.addSpacing(12)
 
+        sep3 = QFrame(); sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep3)
+        layout.addSpacing(4)
+
+        layout.addWidget(_lbl("VOICE MODEL", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        self._voice_status = _lbl(
+            "Present" if voice_downloader.voice_model_present() else "Not downloaded yet",
+            7, color=(C.GREEN if voice_downloader.voice_model_present() else C.ACC2),
+            align=Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(self._voice_status)
+        self._voice_btn = QPushButton("⬇  DOWNLOAD VOICE FILES")
+        self._voice_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._voice_btn.setFixedHeight(28)
+        self._voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._voice_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; }}
+        """)
+        self._voice_btn.clicked.connect(self._download_voice)
+        layout.addWidget(self._voice_btn)
+        layout.addSpacing(8)
+
+        layout.addWidget(_lbl("CONNECT ACCOUNTS (OPTIONAL)", 8, color=C.TEXT_DIM,
+                               align=Qt.AlignmentFlag.AlignLeft))
+        connect_row = QHBoxLayout(); connect_row.setSpacing(4)
+        for app_key, label in [("github", "GitHub"), ("gmail", "Gmail"), ("googlecalendar", "Calendar")]:
+            btn = QPushButton(label)
+            btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+            btn.setFixedHeight(26)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #000d12; color: {C.TEXT_MED};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ color: {C.PRI}; border: 1px solid {C.BORDER_B}; }}
+            """)
+            btn.clicked.connect(lambda _, k=app_key: self._connect_app(k))
+            connect_row.addWidget(btn)
+        layout.addLayout(connect_row)
+        self._connect_status = _lbl("", 7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._connect_status)
+        layout.addSpacing(12)
+
         init_btn = QPushButton("▸  INITIALISE SYSTEMS")
         init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
         init_btn.setFixedHeight(36)
@@ -977,6 +1029,30 @@ class SetupOverlay(QWidget):
                     }}
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
                 """)
+
+    def _download_voice(self):
+        self._voice_btn.setEnabled(False)
+        self._voice_status.setText("Downloading...")
+        self._voice_status.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
+
+        def _status(msg):
+            self._voice_status.setText(msg)
+
+        def _done(ok):
+            self._voice_btn.setEnabled(True)
+            color = C.GREEN if ok else C.RED
+            self._voice_status.setStyleSheet(f"color: {color}; background: transparent;")
+            self._voice_status.setText("Voice files ready." if ok else "Download failed -- check connection.")
+
+        voice_downloader.download_voice_model_async(_status, _done)
+
+    def _connect_app(self, app_key: str):
+        self._connect_status.setText(f"Connecting {app_key}...")
+
+        def _status(msg):
+            self._connect_status.setText(msg)
+
+        composio_connect.connect_app_async(app_key, _status)
 
     def _submit(self):
         key = self._key_input.text().strip()
@@ -1068,7 +1144,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._overlay and self._overlay.isVisible():
-            ow, oh = 460, 390
+            ow, oh = 460, 590
             cw = self.centralWidget()
             self._overlay.setGeometry(
                 (cw.width()  - ow) // 2,
@@ -1429,7 +1505,7 @@ class MainWindow(QMainWindow):
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
         cw = self.centralWidget()
-        ow, oh = 460, 430
+        ow, oh = 460, 590
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
