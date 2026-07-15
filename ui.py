@@ -856,7 +856,7 @@ class _DropCanvas(QWidget):
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str, str)
+    done = pyqtSignal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -895,11 +895,11 @@ class SetupOverlay(QWidget):
         sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
         layout.addSpacing(4)
 
-        layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
+        layout.addWidget(_lbl("GROQ API KEY", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
         self._key_input = QLineEdit()
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
+        self._key_input.setPlaceholderText("gsk_…")
         self._key_input.setFont(QFont("Courier New", 10))
         self._key_input.setFixedHeight(32)
         self._key_input.setStyleSheet(f"""
@@ -912,21 +912,8 @@ class SetupOverlay(QWidget):
         layout.addWidget(self._key_input)
         layout.addSpacing(8)
 
-        layout.addWidget(_lbl("ANTHROPIC API KEY", 8, color=C.TEXT_DIM,
+        layout.addWidget(_lbl("Get a free key at console.groq.com/keys", 7, color=C.PRI_DIM,
                        align=Qt.AlignmentFlag.AlignLeft))
-        self._or_input = QLineEdit()
-        self._or_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._or_input.setPlaceholderText("sk-ant-…")
-        self._or_input.setFont(QFont("Courier New", 10))
-        self._or_input.setFixedHeight(32)
-        self._or_input.setStyleSheet(f"""
-            QLineEdit {{
-                background: #000d12; color: {C.TEXT};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
-            }}
-            QLineEdit:focus {{ border: 1px solid {C.ACC2}; }}
-        """)
-        layout.addWidget(self._or_input)
 
         layout.addSpacing(12)
 
@@ -993,20 +980,13 @@ class SetupOverlay(QWidget):
 
     def _submit(self):
         key = self._key_input.text().strip()
-        or_key = self._or_input.text().strip()
         if not key:
             self._key_input.setStyleSheet(
                 self._key_input.styleSheet() +
                 f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
             return
-        if not or_key:
-            self._or_input.setStyleSheet(
-                self._or_input.styleSheet() +
-                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
-            )
-            return
-        self.done.emit(key, or_key, self._sel_os)
+        self.done.emit(key, self._sel_os)
 
 
 class MainWindow(QMainWindow):
@@ -1442,9 +1422,7 @@ class MainWindow(QMainWindow):
         if not API_FILE.exists(): return False
         try:
             d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return (bool(d.get("gemini_api_key")) and
-                    bool(d.get("anthropic_api_key")) and
-                    bool(d.get("os_system")))
+            return bool(d.get("groq_api_key")) and bool(d.get("os_system"))
         except Exception:
             return False
 
@@ -1461,17 +1439,17 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    # Change signature:
-    def _on_setup_done(self, key: str, anthropic_key: str, os_name: str):
+    def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({
-                "gemini_api_key":    key,
-                "anthropic_api_key": anthropic_key,
-                "os_system":         os_name,
-            }, indent=4),
-            encoding="utf-8",
-        )
+        existing = {}
+        if API_FILE.exists():
+            try:
+                existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        existing["groq_api_key"] = key
+        existing["os_system"]    = os_name
+        API_FILE.write_text(json.dumps(existing, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
