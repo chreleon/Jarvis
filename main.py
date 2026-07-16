@@ -34,6 +34,7 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from composio_agent            import run_agentic_task
+from clap_listen                import start_clap_listener
 
 
 def get_base_dir():
@@ -921,7 +922,20 @@ class JeevesLive:
             stream.stop()
             stream.close()
 
+    def _maybe_start_clap_listener(self):
+        """Optional: enable by setting {"enable_clap_wake": true} in config/api_keys.json.
+        Off by default -- does nothing unless explicitly turned on."""
+        try:
+            with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("enable_clap_wake"):
+                start_clap_listener(lambda: setattr(self.ui, "muted", not self.ui.muted))
+                print("[JEEVES] Clap wake enabled -- double-clap toggles mute.")
+        except Exception as e:
+            print(f"[JEEVES] Clap listener not started: {e}")
+
     async def run(self):
+        self._maybe_start_clap_listener()
         while True:
             try:
                 print("[JEEVES] Starting local voice pipeline (Whisper + Groq + Piper)...")
