@@ -1082,7 +1082,9 @@ class MainWindow(QMainWindow):
         )
 
         self.on_text_command  = None
+        self.on_clap_toggle   = None
         self._muted           = False
+        self._clap_enabled    = self._load_clap_enabled()
         self._current_file: str | None = None
 
         central = QWidget()
@@ -1368,6 +1370,14 @@ class MainWindow(QMainWindow):
         self._style_mute_btn()
         lay.addWidget(self._mute_btn)
 
+        self._clap_btn = QPushButton()
+        self._clap_btn.setFixedHeight(28)
+        self._clap_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._clap_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._clap_btn.clicked.connect(self._toggle_clap)
+        self._style_clap_btn()
+        lay.addWidget(self._clap_btn)
+
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
         fs_btn.setFont(QFont("Courier New", 7))
@@ -1494,6 +1504,57 @@ class MainWindow(QMainWindow):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
 
+    def _load_clap_enabled(self) -> bool:
+        if not API_FILE.exists():
+            return False
+        try:
+            d = json.loads(API_FILE.read_text(encoding="utf-8"))
+            return bool(d.get("enable_clap_wake", False))
+        except Exception:
+            return False
+
+    def _style_clap_btn(self):
+        if self._clap_enabled:
+            self._clap_btn.setText("\U0001F44F  CLAP WAKE: ON")
+            self._clap_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #00140a; color: {C.GREEN};
+                    border: 1px solid {C.GREEN}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ background: #001f10; }}
+            """)
+        else:
+            self._clap_btn.setText("\U0001F44F  CLAP WAKE: OFF")
+            self._clap_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #0a0a0a; color: {C.TEXT_DIM};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                }}
+                QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+            """)
+
+    def _toggle_clap(self):
+        self._clap_enabled = not self._clap_enabled
+        self._style_clap_btn()
+
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        existing = {}
+        if API_FILE.exists():
+            try:
+                existing = json.loads(API_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        existing["enable_clap_wake"] = self._clap_enabled
+        API_FILE.write_text(json.dumps(existing, indent=4), encoding="utf-8")
+
+        self._log.append_log(
+            f"SYS: Clap wake {'enabled' if self._clap_enabled else 'disabled'}."
+        )
+        if self.on_clap_toggle:
+            threading.Thread(
+                target=self.on_clap_toggle, args=(self._clap_enabled,), daemon=True
+            ).start()
+
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
         try:
@@ -1570,6 +1631,14 @@ class JeevesUI:
     @on_text_command.setter
     def on_text_command(self, cb):
         self._win.on_text_command = cb
+
+    @property
+    def on_clap_toggle(self):
+        return self._win.on_clap_toggle
+
+    @on_clap_toggle.setter
+    def on_clap_toggle(self, cb):
+        self._win.on_clap_toggle = cb
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
