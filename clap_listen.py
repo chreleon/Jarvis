@@ -7,14 +7,12 @@ and fires a callback -- useful as a hands-free alternative to a wake
 word, e.g. to toggle Jeeves' mute state without saying anything.
 
 This module does nothing unless something explicitly starts it (see
-start_clap_listener below), so importing it has zero effect on the
-rest of Jeeves' behavior.
+start_clap_listener / ClapListener below), so importing it has zero
+effect on the rest of Jeeves' behavior.
 
 Tuning here follows the same proven shape as other clap-detection
 scripts in the wild (tight double-clap gap, retrigger hysteresis,
-a quiet-gated noise floor, and mic auto-fallback), rather than a
-looser first pass -- these details are what separate "works most of
-the time" from "rarely false-triggers, rarely misses a clap".
+a quiet-gated noise floor, and mic auto-fallback).
 """
 
 import threading
@@ -83,24 +81,45 @@ def _pick_input_device():
     return best_idx
 
 
-def start_clap_listener(on_double_clap, device=None):
+class ClapListener:
     """
-    Starts a background thread that listens for a double-clap and calls
-    on_double_clap() (no arguments) each time one is detected.
-
-    Safe to call once at startup; does nothing until then. If `device`
-    is not given, auto-probes for a working microphone (falling back to
-    the loudest available input if the system default is silent).
-    Returns the background thread (daemon=True).
+    Controllable double-clap listener. Unlike a fire-and-forget thread,
+    this can be cleanly started and stopped multiple times -- needed for
+    a live on/off toggle in the UI rather than only a startup-time flag.
     """
 
-    def _loop():
-        chosen_device = device if device is not None else _pick_input_device()
+    def __init__(self, on_double_clap, device=None):
+        self.on_double_clap = on_double_clap
+        self.device = device
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self):
+        if self.is_running():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="ClapListenThread")
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        # The stream is closed by its own context manager once the loop
+        # notices the stop event (checked every 0.2s below), so we just
+        # need to wait briefly for that to happen.
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+        self._thread = None
+
+    def _loop(self):
+        chosen_device = self.device if self.device is not None else _pick_input_device()
 
         background_level = MIN_RMS
         last_clap_time = 0.0
         pending_first_clap = None
-        armed = True  # False while we're waiting for the level to drop (retrigger gate)
+        armed = True  # False while waiting for the level to drop (retrigger gate)
 
         def callback(indata, frames, time_info, status):
             nonlocal background_level, last_clap_time, pending_first_clap, armed
@@ -109,8 +128,6 @@ def start_clap_listener(on_double_clap, device=None):
             now = time.time()
             threshold = background_level * SPIKE_RATIO
 
-            # Only adapt the noise floor when things are quiet -- a clap
-            # itself must never drag the baseline upward.
             if level < background_level * QUIET_GATE_MULT:
                 background_level = NOISE_FLOOR_ALPHA * background_level + (1 - NOISE_FLOOR_ALPHA) * level
 
@@ -127,7 +144,7 @@ def start_clap_listener(on_double_clap, device=None):
             if not is_spike:
                 return
 
-            armed = False  # require the level to fall before counting another hit
+            armed = False
             last_clap_time = now
 
             if pending_first_clap is None:
@@ -138,11 +155,11 @@ def start_clap_listener(on_double_clap, device=None):
             if MIN_DOUBLE_GAP_S <= gap <= MAX_DOUBLE_GAP_S:
                 pending_first_clap = None
                 try:
-                    on_double_clap()
+                    self.on_double_clap()
                 except Exception as e:
                     print(f"[ClapListen] on_double_clap callback error: {e}")
             elif gap > MAX_DOUBLE_GAP_S:
-                pending_first_clap = now  # too slow -- treat this as a fresh first clap
+                pending_first_clap = now
             # if gap < MIN_DOUBLE_GAP_S, ignore it as the same clap's echo
 
         try:
@@ -155,20 +172,28 @@ def start_clap_listener(on_double_clap, device=None):
                 callback=callback,
             ):
                 print(f"[ClapListen] Listening for double-claps (device={chosen_device})...")
-                while True:
+                while not self._stop_event.is_set():
                     time.sleep(0.2)
+                print("[ClapListen] Stopped.")
         except Exception as e:
             print(f"[ClapListen] Could not start (mic busy or unavailable?): {e}")
 
-    thread = threading.Thread(target=_loop, daemon=True, name="ClapListenThread")
-    thread.start()
-    return thread
+
+def start_clap_listener(on_double_clap, device=None) -> ClapListener:
+    """
+    Convenience wrapper: creates a ClapListener, starts it immediately,
+    and returns it so the caller can later call .stop() if they want a
+    live on/off toggle rather than a fire-and-forget listener.
+    """
+    listener = ClapListener(on_double_clap, device=device)
+    listener.start()
+    return listener
 
 
 if __name__ == "__main__":
     def _demo():
         print("Double-clap detected!")
-    start_clap_listener(_demo)
+    l = start_clap_listener(_demo)
     print("Clap twice near your mic to test. Ctrl+C to quit.")
     while True:
         time.sleep(1)
