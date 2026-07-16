@@ -34,7 +34,7 @@ from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
 from composio_agent            import run_agentic_task
-from clap_listen                import start_clap_listener
+from clap_listen                import ClapListener
 
 
 def get_base_dir():
@@ -537,7 +537,9 @@ class JeevesLive:
         self._is_speaking    = False
         self._speaking_lock  = threading.Lock()
         self.conversation    = []
+        self._clap_listener: ClapListener | None = None
         self.ui.on_text_command = self._on_text_command
+        self.ui.on_clap_toggle  = self._on_clap_toggle
 
     def _on_text_command(self, text: str):
         if not self._loop:
@@ -922,15 +924,32 @@ class JeevesLive:
             stream.stop()
             stream.close()
 
+    def _on_clap_toggle(self, enabled: bool):
+        """
+        Called both at startup (based on the saved config flag) and live,
+        whenever the CLAP WAKE button in the app is clicked. Starts or
+        stops the double-clap listener accordingly -- no restart needed.
+        """
+        if enabled:
+            if self._clap_listener is None:
+                self._clap_listener = ClapListener(
+                    lambda: setattr(self.ui, "muted", not self.ui.muted)
+                )
+            if not self._clap_listener.is_running():
+                self._clap_listener.start()
+                print("[JEEVES] Clap wake enabled -- double-clap toggles mute.")
+        else:
+            if self._clap_listener is not None and self._clap_listener.is_running():
+                self._clap_listener.stop()
+                print("[JEEVES] Clap wake disabled.")
+
     def _maybe_start_clap_listener(self):
-        """Optional: enable by setting {"enable_clap_wake": true} in config/api_keys.json.
-        Off by default -- does nothing unless explicitly turned on."""
+        """Reads the saved config flag once at startup and starts the
+        listener if it was left enabled from a previous session."""
         try:
             with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            if cfg.get("enable_clap_wake"):
-                start_clap_listener(lambda: setattr(self.ui, "muted", not self.ui.muted))
-                print("[JEEVES] Clap wake enabled -- double-clap toggles mute.")
+            self._on_clap_toggle(bool(cfg.get("enable_clap_wake", False)))
         except Exception as e:
             print(f"[JEEVES] Clap listener not started: {e}")
 
