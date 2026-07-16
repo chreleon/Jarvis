@@ -24,3 +24,5 @@ piper-tts
 composio-core
 composio-openai
 flask
+PyQt6
+psutil
