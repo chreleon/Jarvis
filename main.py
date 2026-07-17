@@ -33,7 +33,15 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
-from composio_agent            import run_agentic_task
+try:
+    from composio_agent import run_agentic_task
+except Exception as _composio_import_error:
+    def run_agentic_task(request: str) -> str:
+        return (
+            f"Composio isn't available right now ({_composio_import_error}). "
+            "Check that composio and composio-openai are installed and "
+            "up to date, or run 'python doctor.py' for details."
+        )
 from clap_listen                import ClapListener
 
 
