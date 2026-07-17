@@ -58,10 +58,20 @@ class ClaudeClient:
     """
 
     def __init__(self) -> None:
-        self.api_key = _load_api_key()
-        self._client = Groq(api_key=self.api_key)
+        # Lazy: do NOT load the key or construct the Groq client here.
+        # main.py imports this module before the setup screen has a chance
+        # to create config/api_keys.json -- constructing eagerly would crash
+        # the whole app on first launch. Everything is created on first use.
+        self.api_key = None
+        self._client = None
+
+    def _ensure_client(self):
+        if self._client is None:
+            self.api_key = _load_api_key()
+            self._client = Groq(api_key=self.api_key)
 
     def _call(self, model, system, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+        self._ensure_client()
         try:
             full_messages = [{"role": "system", "content": system}] + messages
             response = self._client.chat.completions.create(
@@ -93,6 +103,7 @@ class ClaudeClient:
             raise ValueError(f"Model returned unparseable JSON: {e}\nRaw output: {raw[:200]}")
 
     def vision(self, prompt, image_b64, mime="image/png", system="Analyze the image and describe what you see clearly and concisely.", model=None, max_tokens=1024) -> str:
+        self._ensure_client()
         vision_model = "llama-3.2-90b-vision-preview"
         messages = [{"role": "user", "content": [
             {"type": "text", "text": prompt},
