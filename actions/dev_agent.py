@@ -5,26 +5,21 @@ import re
 import time
 from pathlib import Path
 
+from actions.remote_runner import remote_execution_enabled, remote_run_command
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR         = get_base_dir()
-API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER    = "gemini-2.5-flash"
-MODEL_WRITER     = "gemini-2.5-flash"
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+# Model constants for the planning / writing / fixing steps. None means
+# ClaudeModelShim falls back to the configured brain model (Groq default
+# or GitHub gpt-4.1). These were previously hardcoded Gemini model names
+# that no longer exist after the provider refactor.
+MODEL_PLANNER = None
+MODEL_WRITER  = None
 
 
-def _get_model(model_name: str):
+def _get_model(model_name: str | None = None):
     from or_client import ClaudeModelShim
     return ClaudeModelShim(model_name=model_name)
 
@@ -248,6 +243,14 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
         return f"All dependencies already installed: {', '.join(dependencies)}"
 
     print(f"[DevAgent] 📦 Installing: {to_install}")
+    if remote_execution_enabled():
+        command = "python3 -m pip install " + " ".join(to_install)
+        try:
+            output = remote_run_command(command, project_dir, timeout=120)
+            return f"Installed remotely: {', '.join(to_install)}\n{output}" if output else f"Installed remotely: {', '.join(to_install)}"
+        except Exception as e:
+            return f"Install error (non-fatal): {e}"
+
     try:
         result = subprocess.run(
             [sys.executable, "-m", "pip", "install"] + to_install,
@@ -286,6 +289,12 @@ def _open_vscode(project_dir: Path) -> bool:
 
 def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
     print(f"[DevAgent] 🚀 Running: {run_command}")
+    if remote_execution_enabled():
+        try:
+            return remote_run_command(run_command, project_dir, timeout=timeout)
+        except Exception as e:
+            return f"Remote run error: {e}"
+
     try:
         parts = run_command.split()
         if parts[0].lower() == "python":

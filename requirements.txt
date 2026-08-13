@@ -19,10 +19,18 @@ youtube-transcript-api
 pywinauto
 pyaudio
 groq
+requests
 faster-whisper
 piper-tts
 composio-core
 composio-openai
+mcp
 flask
 PyQt6
 psutil
+fastapi
+uvicorn[standard]
+qrcode[pil]
+# TTS fallback (used automatically when the Piper voice model is missing)
+edge-tts
+av

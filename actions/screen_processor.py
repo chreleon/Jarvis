@@ -7,12 +7,32 @@ import os
 import sys
 import time
 import threading
-import cv2
-import mss
-import mss.tools
 import sounddevice as sd
 import numpy as np
 from pathlib import Path
+
+# cv2 (OpenCV) and mss are heavy (~10s cold import, ~26MB combined) and
+# only needed for camera/screenshot capture. They're loaded lazily on first
+# use instead of at module import, so importing this module (which happens
+# for every tool call via _load_runtime_imports) stays cheap. PEP 562
+# __getattr__ keeps every `cv2.`/`mss.` call site working unchanged.
+_cv2 = None
+_mss = None
+
+def __getattr__(name: str):
+    global _cv2, _mss
+    if name == "cv2":
+        if _cv2 is None:
+            import cv2
+            _cv2 = cv2
+        return _cv2
+    if name == "mss":
+        if _mss is None:
+            import mss
+            import mss.tools  # noqa: F401  (needed for mss.tools.to_png)
+            _mss = mss
+        return _mss
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 try:
     import PIL.Image
@@ -20,8 +40,33 @@ try:
 except ImportError:
     _PIL_OK = False
 
-from google import genai
-from google.genai import types
+# Gemini Live is optional. When the genai package is unavailable, screen
+# capture still works and analysis falls back to the shared brain client
+# (Groq vision / GitHub gpt-4.1).
+#
+# IMPORTANT (perf): the google-genai SDK costs ~14s of cold import time, so
+# it is NOT imported at module load — _ensure_genai() loads it lazily the
+# first time a live vision session is actually requested.
+genai = None
+types = None
+_GENAI_OK = False
+_genai_loaded = False
+
+
+def _ensure_genai():
+    """Lazily import the google-genai SDK (14s cold). Returns _GENAI_OK."""
+    global genai, types, _GENAI_OK, _genai_loaded
+    if not _genai_loaded:
+        _genai_loaded = True
+        try:
+            from google import genai
+            from google.genai import types
+            _GENAI_OK = True
+        except Exception:
+            genai = None
+            types = None
+            _GENAI_OK = False
+    return _GENAI_OK
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -41,7 +86,7 @@ IMG_MAX_H = 360
 JPEG_Q    = 55
 
 SYSTEM_PROMPT = (
-    "You are JEEVES from Iron Man movies. "
+    "You are JEEVES like Jarvis from Iron Man movies. "
     "Analyze images with technical precision and intelligence. "
     "Help the user in a way they can understand — don't be overly complex. "
     "Be concise, smart, and helpful like Tony Stark's AI assistant. "
@@ -52,12 +97,20 @@ SYSTEM_PROMPT = (
 
 
 def _get_api_key() -> str:
+    """Load the Gemini API key needed for the live vision session.
+
+    Vision uses Google's genai SDK directly, so it needs the actual
+    gemini_api_key (not a Groq/GitHub key).
+    """
     try:
         with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
             keys = json.load(f)
-        key = keys.get("gemini_api_key", "")
+        key = keys.get("gemini_api_key", "") or ""
         if not key:
-            raise ValueError("gemini_api_key not found")
+            raise ValueError(
+                "gemini_api_key not found in config/api_keys.json. "
+                "The vision module requires a valid Gemini API key."
+            )
         return key
     except Exception as e:
         raise RuntimeError(f"Could not load API key: {e}")
@@ -180,6 +233,7 @@ class _LiveSession:
         self._audio_in  = asyncio.Queue()
         self._send_lock = asyncio.Lock()
 
+        _ensure_genai()  # lazy 14s SDK import — only paid for live sessions
         client = genai.Client(
             api_key=_get_api_key(),
             http_options={"api_version": "v1beta"}
@@ -307,6 +361,25 @@ def _ensure_started(player=None):
             _live._player = player
 
 
+def _analyze_still(image_bytes: bytes, mime_type: str, user_text: str) -> str:
+    """Analyze a captured frame through the shared brain client (no Gemini).
+
+    Used when the Gemini Live package or gemini_api_key is unavailable so
+    screen analysis still produces an answer instead of failing silently.
+    """
+    try:
+        from or_client import client
+
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        reply = client.vision(user_text, b64, mime=mime_type)
+        reply = (reply or "").strip()
+        print(f"[ScreenProcess] 💬 {reply}")
+        return reply
+    except Exception as e:
+        print(f"[ScreenProcess] ❌ Vision fallback failed: {e}")
+        return ""
+
+
 def screen_process(
     parameters:     dict,
     response:       str | None = None,
@@ -338,8 +411,23 @@ def screen_process(
         print(f"[ScreenProcess] ❌ Capture error: {e}")
         return False
 
-    print(f"[ScreenProcess] 📦 {len(image_bytes)} bytes → sending")
-    _live.analyze(image_bytes, mime_type, user_text)
+    print(f"[ScreenProcess] 📦 {len(image_bytes)} bytes → analyzing")
+
+    # Prefer the Gemini Live session when both the package and a valid API
+    # key exist; otherwise analyze the still image through the shared brain.
+    use_live = _ensure_genai()
+    if use_live:
+        try:
+            _get_api_key()
+        except Exception:
+            use_live = False
+
+    if use_live:
+        _ensure_started(player=player)
+        _live.analyze(image_bytes, mime_type, user_text)
+        return True
+
+    _analyze_still(image_bytes, mime_type, user_text)
     return True
 
 

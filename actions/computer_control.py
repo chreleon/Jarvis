@@ -9,13 +9,35 @@ import time
 import random
 from pathlib import Path
 
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = True
-    pyautogui.PAUSE    = 0.05
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+# pyautogui is heavy (~1s cold, ~13MB) and only needed for actual input
+# actions — loaded lazily on first use (PEP 562 __getattr__).
+_pyautogui = None
+_PYAUTOGUI = False
+_pyautogui_loaded = False
+
+
+def _ensure_pyautogui() -> bool:
+    """Lazily import pyautogui; returns True when available."""
+    global _pyautogui, _PYAUTOGUI, _pyautogui_loaded
+    if not _pyautogui_loaded:
+        _pyautogui_loaded = True
+        try:
+            import pyautogui
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE    = 0.05
+            _pyautogui = pyautogui
+            _PYAUTOGUI = True
+        except ImportError:
+            _PYAUTOGUI = False
+    return _PYAUTOGUI
+
+
+def __getattr__(name: str):
+    global _pyautogui
+    if name == "pyautogui":
+        _ensure_pyautogui()
+        return _pyautogui
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 try:
     import pyperclip
@@ -61,7 +83,7 @@ def _safe_screenshot_path(requested: str | None) -> Path:
     return fallback
 
 def _require_pyautogui():
-    if not _PYAUTOGUI:
+    if not _ensure_pyautogui():
         raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
 
 _FIRST_NAMES = [

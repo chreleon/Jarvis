@@ -17,9 +17,9 @@ def _base_dir() -> Path:
 
 VOICES_DIR = _base_dir() / "voices"
 
-VOICE_NAME = "en_GB-alan-medium"
+VOICE_NAME = "en_GB-jenny_dioco-medium"
 _RELEASE_BASE = (
-    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium"
+    "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/jenny_dioco/medium"
 )
 FILES = {
     f"{VOICE_NAME}.onnx":      f"{_RELEASE_BASE}/{VOICE_NAME}.onnx",

@@ -1,17 +1,10 @@
 import json
-import sys
 from pathlib import Path
 
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH, normalize_api_key
 
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR    = get_base_dir()
 CONFIG_DIR  = BASE_DIR / "config"
-CONFIG_FILE = CONFIG_DIR / "api_keys.json"
+CONFIG_FILE = CONFIG_PATH
 
 
 def ensure_config_dir() -> None:
@@ -22,7 +15,16 @@ def config_exists() -> bool:
     return CONFIG_FILE.exists()
 
 
-def save_api_keys(gemini_api_key: str = "", anthropic_api_key: str = "") -> None:
+def save_api_keys(groq_api_key: str | list | tuple = "", github_models_api_key: str = "", gemini_api_key: str = "") -> None:
+    """Save one or more API keys to the config file.
+
+    Args:
+        groq_api_key: Groq API key(s) (primary LLM provider) — a single
+            string or a list of keys. A list is stored as-is so Jeeves can
+            rotate across multiple free-tier keys.
+        github_models_api_key: GitHub Models API key (alternative LLM provider).
+        gemini_api_key: Gemini API key (only needed for vision/screen processing).
+    """
     ensure_config_dir()
 
     data: dict = {}
@@ -32,10 +34,21 @@ def save_api_keys(gemini_api_key: str = "", anthropic_api_key: str = "") -> None
         except Exception:
             data = {}
 
+    if groq_api_key:
+        if isinstance(groq_api_key, (list, tuple)):
+            keys = []
+            for k in groq_api_key:
+                s = str(k).strip()
+                if s:
+                    keys.append(s)
+            if keys:
+                data["groq_api_key"] = keys if len(keys) > 1 else keys[0]
+        else:
+            data["groq_api_key"] = groq_api_key.strip()
+    if github_models_api_key:
+        data["github_models_api_key"] = github_models_api_key.strip()
     if gemini_api_key:
         data["gemini_api_key"] = gemini_api_key.strip()
-    if anthropic_api_key:
-        data["anthropic_api_key"] = anthropic_api_key.strip()
 
     CONFIG_FILE.write_text(
         json.dumps(data, indent=2),
@@ -54,16 +67,14 @@ def load_api_keys() -> dict:
 
 
 def get_gemini_key() -> str | None:
-    return load_api_keys().get("gemini_api_key")
-
-
-def get_anthropic_key() -> str | None:
-    return load_api_keys().get("anthropic_api_key")
+    return normalize_api_key(load_api_keys().get("gemini_api_key", "") or "") \
+        or normalize_api_key(load_api_keys().get("groq_api_key", "") or "")
 
 
 def is_configured() -> bool:
-    # Gemini is still needed for the live voice loop (main.py / screen_processor.py);
-    # Anthropic is needed for everything else (planning, code help, file processing, etc.)
-    gemini_key    = get_gemini_key()
-    anthropic_key = get_anthropic_key()
-    return bool(gemini_key and len(gemini_key) > 15) and bool(anthropic_key and len(anthropic_key) > 15)
+    """Check if at least one LLM provider key is configured."""
+    keys = load_api_keys()
+    groq_key = normalize_api_key(keys.get("groq_api_key", "") or "")
+    github_key = normalize_api_key(keys.get("github_models_api_key", "") or "")
+    gemini_key = normalize_api_key(keys.get("gemini_api_key", "") or "")
+    return bool((groq_key and len(groq_key) > 15) or (github_key and len(github_key) > 15) or (gemini_key and len(gemini_key) > 15))

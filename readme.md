@@ -41,6 +41,17 @@ It's not just an assistant — it's an extension of your digital life.
 
 ## ⚡ Quick Start
 
+### Option 1: One-liner CLI (npm)
+```bash
+# Requires Node.js 14+ and Python 3.11+
+npm install -g @chreleon/jeeves
+pip install -r requirements.txt   # Python dependencies (ships with the package)
+jeeves --help
+```
+
+> 📦 The npm package includes the CLI wrapper, all action modules, and `requirements.txt`. Python packages are installed from the bundled file — no need to clone the full repo just to use the CLI.
+
+### Option 2: Full application (from source)
 ```bash
 git clone https://github.com/FatihMakes/Mark-XXXIX-OR.git
 cd Mark-XXXIX-OR
@@ -52,6 +63,32 @@ python main.py
 > ⚠️ **Installation Note:** To keep the repository lightweight, some OS-specific dependencies are not bundled in `requirements.txt`. If you run into a `ModuleNotFoundError`, simply install the missing package via `pip install <module_name>` for your specific system.
 
 ---
+
+## 🧠 Brains / Providers
+
+Jeeves can use multiple LLM providers as its "brain." The project currently
+supports two built-in providers:
+
+- **Groq** — the default provider (free Groq API / LLaMA-family models).
+- **GitHub Models** — GitHub-hosted models such as `gpt-4.1`/`gpt-4.1-mini`.
+
+You can pick the active provider from the in-app setup screen or by editing
+`config/api_keys.json` and setting `brain_provider` to either `groq` or
+`github_models`. Example:
+
+```json
+{
+	"brain_provider": "github_models",
+	"github_models_api_key": "YOUR_GITHUB_MODELS_KEY",
+	"os_system": "windows"
+}
+```
+
+Auto-fallback: if a request fails due to rate limits, quota, or an expired
+API token, Jeeves will attempt the other configured provider and adopt it if
+the fallback request succeeds. This helps keep the assistant responsive when
+one provider becomes temporarily unavailable.
+
 
 ## 📋 Requirements
 

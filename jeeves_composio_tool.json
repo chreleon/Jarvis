@@ -1,0 +1,51 @@
+{
+  "name": "jeeves",
+  "description": "Jeeves assistant: exposes /invoke for sync/async agent calls.",
+  "endpoint": "http://127.0.0.1:8000/invoke",
+  "auth": {
+    "type": "header",
+    "name": "Authorization",
+    "value_template": "Bearer {{secret}}"
+  },
+  "security": {
+    "shared_secret_hint": "Provide the Jeeves API secret as the tool credential"
+  },
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "prompt": {
+        "type": "string"
+      },
+      "system_prompt": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "sync",
+          "async"
+        ]
+      },
+      "callback_url": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "prompt"
+    ]
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "result": {
+        "type": "string"
+      }
+    }
+  }
+}

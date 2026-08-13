@@ -1,18 +1,8 @@
 import json
 import re
-import sys
-from pathlib import Path
 from enum import Enum
 
 
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
 class ErrorDecision(Enum):
@@ -49,11 +39,6 @@ Return ONLY valid JSON:
 """
 
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
 def analyze_error(
     step: dict,
     error: str,
@@ -88,8 +73,8 @@ def analyze_error(
             "user_message":  "Trying a different approach, sir."
         }
 
-    from or_client import ClaudeModelShim
-    model = ClaudeModelShim(model_name="claude-haiku-4-5-20251001", system_instruction=ERROR_ANALYST_PROMPT)
+    from or_client import ClaudeModelShim, GROQ_LITE_MODEL
+    model = ClaudeModelShim(model_name=GROQ_LITE_MODEL, system_instruction=ERROR_ANALYST_PROMPT)
 
     prompt = f"""Failed step:
 Tool: {step.get('tool')}
@@ -144,7 +129,7 @@ def generate_fix(step: dict, error: str, fix_suggestion: str) -> dict:
     Returns a modified step dict.
     """
     from or_client import ClaudeModelShim
-    model = ClaudeModelShim(model_name="claude-sonnet-5")
+    model = ClaudeModelShim()
 
     prompt = f"""A task step failed. Generate a replacement step.
 

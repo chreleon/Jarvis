@@ -9,11 +9,42 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
-try:
-    import pyautogui
-    _PYAUTOGUI = True
-except ImportError:
-    _PYAUTOGUI = False
+# External commands (osascript/gsettings/qdbus/...) go through _run_cmd so a
+# wedged system daemon can never hang Jeeves indefinitely.
+_DEFAULT_CMD_TIMEOUT = 10
+
+
+def _run_cmd(*args, **kwargs):
+    kwargs.setdefault("timeout", _DEFAULT_CMD_TIMEOUT)
+    return subprocess.run(*args, **kwargs)
+
+# pyautogui is heavy (~1s cold, ~13MB) and only needed for actual desktop
+# actions — loaded lazily on first use (PEP 562 __getattr__).
+_pyautogui = None
+_PYAUTOGUI = False
+_pyautogui_loaded = False
+
+
+def _ensure_pyautogui() -> bool:
+    """Lazily import pyautogui; returns True when available."""
+    global _pyautogui, _PYAUTOGUI, _pyautogui_loaded
+    if not _pyautogui_loaded:
+        _pyautogui_loaded = True
+        try:
+            import pyautogui
+            _pyautogui = pyautogui
+            _PYAUTOGUI = True
+        except ImportError:
+            _PYAUTOGUI = False
+    return _PYAUTOGUI
+
+
+def __getattr__(name: str):
+    global _pyautogui
+    if name == "pyautogui":
+        _ensure_pyautogui()
+        return _pyautogui
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -55,7 +86,7 @@ def _build_sandbox() -> dict:
         "os_path": os.path,  
     }
 
-    if _PYAUTOGUI:
+    if _ensure_pyautogui():
         sandbox["pyautogui"] = pyautogui
 
     if _OS == "Windows":
@@ -154,7 +185,7 @@ def set_wallpaper(image_path: str) -> str:
                 f'tell application "System Events" to tell every desktop to '
                 f'set picture to POSIX file "{path}"'
             )
-            subprocess.run(["osascript", "-e", script], capture_output=True)
+            _run_cmd(["osascript", "-e", script], capture_output=True)
             return f"Wallpaper set: {path.name}"
 
         else:
@@ -162,11 +193,11 @@ def set_wallpaper(image_path: str) -> str:
             uri = f"file://{path}"
 
             if "gnome" in desktop_env or "unity" in desktop_env:
-                subprocess.run([
+                _run_cmd([
                     "gsettings", "set", "org.gnome.desktop.background",
                     "picture-uri", uri
                 ], capture_output=True)
-                subprocess.run([
+                _run_cmd([
                     "gsettings", "set", "org.gnome.desktop.background",
                     "picture-uri-dark", uri
                 ], capture_output=True)
@@ -182,21 +213,21 @@ for (var i = 0; i < allDesktops.length; i++) {{
     d.writeConfig("Image", "file://{path}");
 }}
 """
-                subprocess.run(
+                _run_cmd(
                     ["qdbus", "org.kde.plasmashell", "/PlasmaShell",
                      "org.kde.PlasmaShell.evaluateScript", script],
                     capture_output=True
                 )
 
             elif "xfce" in desktop_env:
-                subprocess.run([
+                _run_cmd([
                     "xfconf-query", "-c", "xfce4-desktop",
                     "-p", "/backdrop/screen0/monitor0/workspace0/last-image",
                     "-s", str(path)
                 ], capture_output=True)
 
             else:
-                result = subprocess.run(
+                result = _run_cmd(
                     ["feh", "--bg-scale", str(path)],
                     capture_output=True
                 )
@@ -243,7 +274,7 @@ def get_current_wallpaper() -> str:
             script = (
                 'tell application "System Events" to get picture of desktop 1'
             )
-            result = subprocess.run(
+            result = _run_cmd(
                 ["osascript", "-e", script],
                 capture_output=True, text=True
             )
@@ -252,7 +283,7 @@ def get_current_wallpaper() -> str:
         else:
             desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
             if "gnome" in desktop_env or "unity" in desktop_env:
-                result = subprocess.run(
+                result = _run_cmd(
                     ["gsettings", "get", "org.gnome.desktop.background", "picture-uri"],
                     capture_output=True, text=True
                 )

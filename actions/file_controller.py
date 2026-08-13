@@ -99,14 +99,20 @@ def delete_file(path: str, confirm: bool = True) -> str:
     """
     Deletes a file or folder.
     Moves to Recycle Bin on Windows if possible, otherwise permanent delete.
+    Requires explicit confirmation before performing destructive work.
     """
     try:
         target = Path(path).expanduser()
         if not target.exists():
             return f"Not found: {path}"
 
-        try:
+        if not confirm:
+            return (
+                f"This will delete '{target.name}'. "
+                f"Please confirm by calling again with confirm=True."
+            )
 
+        try:
             send2trash.send2trash(str(target))
             return f"Moved to Recycle Bin: {target.name}"
         except ImportError:
@@ -420,7 +426,8 @@ def file_controller(
 
         elif action == "delete":
             full = _full_path(path, name)
-            result = delete_file(full)
+            confirmed = parameters.get("confirm", parameters.get("confirmed", False))
+            result = delete_file(full, confirm=bool(confirmed))
 
         elif action == "move":
             full = _full_path(path, name)

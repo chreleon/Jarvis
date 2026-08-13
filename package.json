@@ -1,0 +1,50 @@
+{
+  "name": "@chreleon/jeeves",
+  "version": "2.0.0",
+  "description": "MARK XXXIX-OR (Jeeves) — Terminal interface for the ultimate cross-platform personal AI assistant. Wraps cli.py for npm-based installation.",
+  "bin": {
+    "jeeves": "./cli.js"
+  },
+  "keywords": [
+    "jeeves",
+    "ai",
+    "assistant",
+    "cli",
+    "voice",
+    "automation",
+    "mark-39"
+  ],
+  "homepage": "https://github.com/FatihMakes/Mark-XXXIX-OR",
+  "bugs": {
+    "url": "https://github.com/FatihMakes/Mark-XXXIX-OR/issues"
+  },
+  "license": "CC-BY-NC-4.0",
+  "author": "FatihMakes (https://www.youtube.com/@FatihMakes)",
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "preferGlobal": true,
+  "files": [
+    "cli.js",
+    "cli.py",
+    "config/",
+    "core/",
+    "actions/",
+    "agent/",
+    "memory/",
+    "voices/",
+    "requirements.txt",
+    "readme.md"
+  ],
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.40",
+    "@composio/core": "^0.16.0",
+    "ai": "^7.0.62",
+    "list": "^2.0.19"
+  }
+}

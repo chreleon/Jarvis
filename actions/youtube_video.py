@@ -8,15 +8,35 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote_plus
-
-import pyautogui
 import numpy as np
 
-try:
-    import requests
-    _REQUESTS_OK = True
-except ImportError:
-    _REQUESTS_OK = False
+# requests is heavy (~1.2s cold) and only needed for network calls —
+# loaded lazily on first use (PEP 562 __getattr__).
+_requests = None
+_REQUESTS_OK = False
+_requests_loaded = False
+
+
+def _ensure_requests() -> bool:
+    """Lazily import requests; returns True when available."""
+    global _requests, _REQUESTS_OK, _requests_loaded
+    if not _requests_loaded:
+        _requests_loaded = True
+        try:
+            import requests
+            _requests = requests
+            _REQUESTS_OK = True
+        except ImportError:
+            _REQUESTS_OK = False
+    return _REQUESTS_OK
+
+
+def __getattr__(name: str):
+    global _requests
+    if name == "requests":
+        _ensure_requests()
+        return _requests
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -60,7 +80,7 @@ def _open_url(url: str) -> None:
 
 def _scrape_first_video_url(query: str) -> str | None:
 
-    if not _REQUESTS_OK:
+    if not _ensure_requests():
         return None
 
     search_url = (
@@ -200,7 +220,7 @@ def _save_summary(content: str, video_url: str) -> str:
 
 
 def _scrape_video_info(video_id: str) -> dict:
-    if not _REQUESTS_OK:
+    if not _ensure_requests():
         return {}
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
@@ -233,7 +253,7 @@ def _scrape_video_info(video_id: str) -> dict:
 
 
 def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
-    if not _REQUESTS_OK:
+    if not _ensure_requests():
         return []
     url = f"https://www.youtube.com/feed/trending?gl={region.upper()}"
     try:

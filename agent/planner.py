@@ -1,17 +1,7 @@
 import json
 import re
-import sys
-from pathlib import Path
 
 
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
 PLANNER_PROMPT = """You are the planning module of MARK XXV, a personal AI assistant.
@@ -172,14 +162,10 @@ OUTPUT — return ONLY valid JSON, no markdown, no explanation, no code blocks:
 """
 
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
 def create_plan(goal: str, context: str = "") -> dict:
     from or_client import ClaudeModelShim
-    model = ClaudeModelShim(model_name="claude-haiku-4-5-20251001", system_instruction=PLANNER_PROMPT)
+    from or_client import GROQ_LITE_MODEL
+    model = ClaudeModelShim(model_name=GROQ_LITE_MODEL, system_instruction=PLANNER_PROMPT)
 
     user_input = f"Goal: {goal}"
     if context:
@@ -234,7 +220,7 @@ def _fallback_plan(goal: str) -> dict:
 
 def replan(goal: str, completed_steps: list, failed_step: dict, error: str) -> dict:
     from or_client import ClaudeModelShim
-    model = ClaudeModelShim(model_name="claude-sonnet-5", system_instruction=PLANNER_PROMPT)
+    model = ClaudeModelShim(system_instruction=PLANNER_PROMPT)
 
     completed_summary = "\n".join(
         f"  - Step {s['step']} ({s['tool']}): DONE" for s in completed_steps

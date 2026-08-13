@@ -5,6 +5,7 @@ import math
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import threading
@@ -28,17 +29,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget, QProgressBar,
 )
 
-import voice_downloader
-import composio_connect
-
-def _base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent
-
-BASE_DIR   = _base_dir()
-CONFIG_DIR = BASE_DIR / "config"
-API_FILE   = CONFIG_DIR / "api_keys.json"
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH as API_FILE
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
@@ -75,16 +66,24 @@ class C:
 def qcol(h: str, a: int = 255) -> QColor:
     c = QColor(h); c.setAlpha(a); return c
 
+
+# ── YinYang Opt: GPU/temp detection cached (re-probe every 15s, not 1.5s) ──
 class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
         self.mem  = 0.0
-        self.net  = 0.0   
-        self.gpu  = -1.0  
-        self.tmp  = -1.0  
+        self.net  = 0.0
+        self.gpu  = -1.0
+        self.tmp  = -1.0
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
+        self._last_gpu_t = 0.0           # YinYang: cache GPU probes
+        self._last_tmp_t = 0.0            # YinYang: cache temp probes
+        self._cached_gpu = -1.0           # YinYang
+        self._cached_tmp = -1.0           # YinYang
+        self._gpu_probe_interval = 15.0   # YinYang: every 15s instead of 1.5s
+        self._tmp_probe_interval = 15.0   # YinYang
         self._running = True
         t = threading.Thread(target=self._loop, daemon=True)
         t.start()
@@ -113,9 +112,16 @@ class _SysMetrics:
         self._last_net   = nc
         self._last_net_t = now
 
-        gpu = self._get_gpu()
+        # YinYang: only re-probe GPU/temp every 15s, not every 1.5s
+        if now - self._last_gpu_t >= self._gpu_probe_interval:
+            self._cached_gpu = self._get_gpu()
+            self._last_gpu_t = now
+        gpu = self._cached_gpu
 
-        tmp = self._get_temp()
+        if now - self._last_tmp_t >= self._tmp_probe_interval:
+            self._cached_tmp = self._get_temp()
+            self._last_tmp_t = now
+        tmp = self._cached_tmp
 
         with self._lock:
             self.cpu = cpu
@@ -125,6 +131,7 @@ class _SysMetrics:
             self.tmp = tmp
 
     def _get_gpu(self) -> float:
+        """GPU probe — only called every 15s now instead of every 1.5s."""
         # NVIDIA
         try:
             r = subprocess.run(
@@ -139,8 +146,8 @@ class _SysMetrics:
         except Exception:
             pass
 
-        # AMD (Linux)
         if _OS == "Linux":
+            # AMD (Linux)
             try:
                 r = subprocess.run(
                     ["rocm-smi", "--showuse", "--csv"],
@@ -171,7 +178,7 @@ class _SysMetrics:
             except Exception:
                 pass
 
-        # macOS — powermetrics (GPU Engine)
+        # macOS
         if _OS == "Darwin":
             try:
                 r = subprocess.run(
@@ -190,6 +197,7 @@ class _SysMetrics:
         return -1.0
 
     def _get_temp(self) -> float:
+        """Temperature probe — only called every 15s now."""
         try:
             temps = psutil.sensors_temperatures()
             candidates = ["coretemp", "k10temp", "cpu_thermal", "acpitz",
@@ -245,7 +253,18 @@ class _SysMetrics:
 
 _metrics = _SysMetrics()
 
+
+# ── HudCanvas with YinYang optimizations ────────────────────────────────
 class HudCanvas(QWidget):
+    """Arc-reactor-style HUD canvas.
+
+    YinYang optimizations applied:
+      1. Static geometry (grid, ticks, crosshair, brackets) cached to offscreen QPixmap
+      2. Face pixmap scaling cached — only re-scale when widget size changes
+      3. Adaptive frame rate — idle runs at ~20fps, speaking at 60fps
+      4. Pre-computed waveform heights — random() moved out of paintEvent
+    """
+
     def __init__(self, face_path: str, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -256,25 +275,45 @@ class HudCanvas(QWidget):
         self.speaking = False
         self.state    = "INITIALISING"
 
-        self._tick       = 0
-        self._scale      = 1.0
-        self._tgt_scale  = 1.0
-        self._halo       = 55.0
-        self._tgt_halo   = 55.0
-        self._last_t     = time.time()
-        self._scan       = 0.0
-        self._scan2      = 180.0
-        self._rings      = [0.0, 120.0, 240.0]
+        # ── YinYang: per-frame cached values ──
+        self._tick            = 0
+        self._scale           = 1.0
+        self._tgt_scale       = 1.0
+        self._halo            = 55.0
+        self._tgt_halo        = 55.0
+        self._last_t          = time.time()
+        self._scan            = 0.0
+        self._scan2           = 180.0
+        self._rings           = [0.0, 120.0, 240.0]
         self._pulses: list[float] = [0.0, 50.0, 100.0]
-        self._blink      = True
-        self._blink_tick = 0
+        self._blink           = True
+        self._blink_tick      = 0
         self._particles: list[list[float]] = []
         self._face_px: QPixmap | None = None
+
+        # ── YinYang: cached face scaling ──
+        self._cached_fsz    = 0
+        self._cached_face   = QPixmap()
+
+        # ── YinYang: cached static background pixmap ──
+        self._static_cache: QPixmap | None = None
+        self._static_cache_size = (0, 0)
+
+        # ── YinYang: pre-computed waveform heights ──
+        self._waveform_heights: list[int] = []
+        self._waveform_valid = False
+
+        # ── YinYang: adaptive frame rate ──
+        self._speaking_frame_interval = 16    # ~60 fps when speaking
+        self._idle_frame_interval     = 50    # ~20 fps when idle
+        self._last_frame_w = 0
+        self._last_frame_h = 0
+
         self._load_face(face_path)
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(self._speaking_frame_interval if self.speaking else self._idle_frame_interval)
 
     def _load_face(self, path: str):
         try:
@@ -293,9 +332,29 @@ class HudCanvas(QWidget):
         except Exception:
             self._face_px = None
 
+    # ── YinYang: cache invalidation on resize ──
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._static_cache = None
+        self._cached_fsz = 0
+
+    def _update_frame_rate(self):
+        """YinYang: adjust timer interval based on speaking state."""
+        target = self._speaking_frame_interval if self.speaking else self._idle_frame_interval
+        if self._tmr.interval() != target:
+            self._tmr.setInterval(target)
+
     def _step(self):
         self._tick += 1
         now = time.time()
+        changed = False
+        fw = min(self.width(), self.height())
+
+        # ── YinYang: track widget size for cache invalidation ──
+        w, h = self.width(), self.height()
+        size_changed = (w != self._last_frame_w or h != self._last_frame_h)
+        self._last_frame_w, self._last_frame_h = w, h
+
         if now - self._last_t > (0.12 if self.speaking else 0.5):
             if self.speaking:
                 self._tgt_scale = random.uniform(1.06, 1.14)
@@ -307,19 +366,26 @@ class HudCanvas(QWidget):
                 self._tgt_scale = random.uniform(1.001, 1.008)
                 self._tgt_halo  = random.uniform(48, 68)
             self._last_t = now
+            changed = True
 
+        old_scale = self._scale
+        old_halo  = self._halo
         sp = 0.38 if self.speaking else 0.15
         self._scale += (self._tgt_scale - self._scale) * sp
         self._halo  += (self._tgt_halo  - self._halo)  * sp
+        if abs(self._scale - old_scale) > 0.0001 or abs(self._halo - old_halo) > 0.01:
+            changed = True
 
         speeds = [1.3, -0.9, 2.0] if self.speaking else [0.55, -0.35, 0.9]
         for i, spd in enumerate(speeds):
+            old = self._rings[i]
             self._rings[i] = (self._rings[i] + spd) % 360
+            if abs(self._rings[i] - old) > 0.01:
+                changed = True
 
         self._scan  = (self._scan  + (3.0 if self.speaking else 1.3)) % 360
         self._scan2 = (self._scan2 + (-2.0 if self.speaking else -0.75)) % 360
 
-        fw  = min(self.width(), self.height())
         lim = fw * 0.74
         spd = 4.2 if self.speaking else 2.0
         self._pulses = [r + spd for r in self._pulses if r + spd < lim]
@@ -327,7 +393,7 @@ class HudCanvas(QWidget):
             self._pulses.append(0.0)
 
         if self.speaking and random.random() < 0.28:
-            cx, cy = self.width() / 2, self.height() / 2
+            cx, cy = w / 2, h / 2
             ang = random.uniform(0, 2 * math.pi)
             r_s = fw * 0.28
             self._particles.append([
@@ -339,12 +405,104 @@ class HudCanvas(QWidget):
             [p[0]+p[2], p[1]+p[3], p[2]*0.97, p[3]*0.97, p[4]-0.028]
             for p in self._particles if p[4] > 0
         ]
+        if self._particles:
+            changed = True
+
+        # ── YinYang: pre-compute waveform heights outside paintEvent ──
+        if self.muted:
+            self._waveform_heights = [2] * 36
+        elif self.speaking:
+            self._waveform_heights = [random.randint(3, 20) for _ in range(36)]
+        else:
+            self._waveform_heights = [
+                int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6)) for i in range(36)
+            ]
+        self._waveform_valid = True
 
         self._blink_tick += 1
         if self._blink_tick >= 38:
             self._blink = not self._blink
             self._blink_tick = 0
-        self.update()
+            changed = True
+
+        # ── YinYang: only update() if something actually changed ──
+        if changed or size_changed:
+            self.update()
+
+        # ── YinYang: adapt frame rate ──
+        self._update_frame_rate()
+
+    # ── YinYang: cache static background to offscreen QPixmap ──
+    def _ensure_static_cache(self, p: QPainter, W: int, H: int, fw: int):
+        """Render static geometry (grid, ticks, crosshair, brackets) to a cached pixmap."""
+        if (self._static_cache is not None
+                and self._static_cache_size == (W, H)
+                and not self.speaking
+                and self._halo < 100):
+            p.drawPixmap(0, 0, self._static_cache)
+            return
+
+        cx, cy = W / 2, H / 2
+
+        # ── YinYang: only rebuild cache when geometry changes ──
+        if (self._static_cache is None
+                or self._static_cache_size != (W, H)
+                or self.speaking):
+            cache = QPixmap(W, H)
+            cache.fill(Qt.GlobalColor.transparent)
+            cp = QPainter(cache)
+            cp.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+            # grid dots
+            cp.setPen(QPen(qcol(C.PRI_GHO), 1))
+            for x in range(0, W, 48):
+                for y in range(0, H, 48):
+                    cp.drawPoint(x, y)
+
+            # tick marks
+            t_out, t_in = fw * 0.497, fw * 0.474
+            cp.setPen(QPen(qcol(C.PRI, 140), 1))
+            for deg in range(0, 360, 10):
+                rad = math.radians(deg)
+                inn = t_in if deg % 30 == 0 else t_in + 6
+                cp.drawLine(
+                    QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
+                    QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
+                )
+
+            # crosshair
+            ch_r, gap_h = fw * 0.51, fw * 0.16
+            cp.setPen(QPen(qcol(C.PRI, 140), 1))
+            cp.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
+            cp.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
+            cp.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
+            cp.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
+
+            # corner brackets
+            bl = 24
+            bc = qcol(C.PRI, 210)
+            hl, hr = cx - fw // 2, cx + fw // 2
+            ht, hb = cy - fw // 2, cy + fw // 2
+            cp.setPen(QPen(bc, 2))
+            for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
+                cp.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
+                cp.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
+
+            cp.end()
+            self._static_cache = cache
+            self._static_cache_size = (W, H)
+
+        p.drawPixmap(0, 0, self._static_cache)
+
+        # ── YinYang: crosshair halo (alpha-only, needs per-frame update) ──
+        h_alpha = int(self._halo * 0.5)
+        if h_alpha > 5:
+            ch_r, gap_h = fw * 0.51, fw * 0.16
+            p.setPen(QPen(qcol(C.PRI, h_alpha), 1))
+            p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
+            p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
+            p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
+            p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -355,15 +513,12 @@ class HudCanvas(QWidget):
         cx, cy = W / 2, H / 2
         fw = min(W, H)
 
-        # grid dots
-        p.setPen(QPen(qcol(C.PRI_GHO), 1))
-        for x in range(0, W, 48):
-            for y in range(0, H, 48):
-                p.drawPoint(x, y)
+        # ── YinYang: draw cached static layer ──
+        self._ensure_static_cache(p, W, H, int(fw))
 
         r_face = fw * 0.31
 
-        # halo glow
+        # halo glow (always redrawn — alpha varies per frame)
         for i in range(10):
             r   = r_face * (1.8 - i * 0.08)
             frc = 1.0 - i / 10
@@ -405,44 +560,17 @@ class HudCanvas(QWidget):
         p.setPen(QPen(qcol(C.ACC, sa // 2), 1.5))
         p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
 
-        # tick marks
-        t_out, t_in = fw * 0.497, fw * 0.474
-        p.setPen(QPen(qcol(C.PRI, 140), 1))
-        for deg in range(0, 360, 10):
-            rad = math.radians(deg)
-            inn = t_in if deg % 30 == 0 else t_in + 6
-            p.drawLine(
-                QPointF(cx + t_out * math.cos(rad), cy - t_out * math.sin(rad)),
-                QPointF(cx + inn  * math.cos(rad), cy - inn  * math.sin(rad)),
-            )
-
-        # crosshair
-        ch_r, gap_h = fw * 0.51, fw * 0.16
-        p.setPen(QPen(qcol(C.PRI, int(self._halo * 0.5)), 1))
-        p.drawLine(QPointF(cx - ch_r, cy), QPointF(cx - gap_h, cy))
-        p.drawLine(QPointF(cx + gap_h, cy), QPointF(cx + ch_r, cy))
-        p.drawLine(QPointF(cx, cy - ch_r), QPointF(cx, cy - gap_h))
-        p.drawLine(QPointF(cx, cy + gap_h), QPointF(cx, cy + ch_r))
-
-        # corner brackets
-        bl = 24
-        bc = qcol(C.PRI, 210)
-        hl, hr = cx - fw // 2, cx + fw // 2
-        ht, hb = cy - fw // 2, cy + fw // 2
-        p.setPen(QPen(bc, 2))
-        for bx, by, dx, dy in [(hl,ht,1,1),(hr,ht,-1,1),(hl,hb,1,-1),(hr,hb,-1,-1)]:
-            p.drawLine(QPointF(bx, by), QPointF(bx + dx * bl, by))
-            p.drawLine(QPointF(bx, by), QPointF(bx, by + dy * bl))
-
-        # face
+        # ── YinYang: cached face scaling ──
         if self._face_px:
-            fsz    = int(fw * 0.62 * self._scale)
-            scaled = self._face_px.scaled(
-                fsz, fsz,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), scaled)
+            fsz = int(fw * 0.62 * self._scale)
+            if fsz != self._cached_fsz or self._cached_face.isNull():
+                self._cached_fsz = fsz
+                self._cached_face = self._face_px.scaled(
+                    fsz, fsz,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            p.drawPixmap(int(cx - fsz / 2), int(cy - fsz / 2), self._cached_face)
         else:
             orb_r = int(fw * 0.27 * self._scale)
             oc    = (200, 0, 50) if self.muted else (0, 60, 110)
@@ -488,28 +616,30 @@ class HudCanvas(QWidget):
         p.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         p.drawText(QRectF(0, sy, W, 26), Qt.AlignmentFlag.AlignCenter, txt)
 
-        # waveform
+        # ── YinYang: pre-computed waveform ──
         wy = sy + 30
         N, bw = 36, 8
         wx0 = (W - N * bw) / 2
+        heights = self._waveform_heights if self._waveform_valid and len(self._waveform_heights) == N else [2] * N
         for i in range(N):
+            hgt = heights[i]
             if self.muted:
-                hgt, cl = 2, qcol(C.MUTED_C)
+                cl = qcol(C.MUTED_C)
             elif self.speaking:
-                hgt = random.randint(3, 20)
-                cl  = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
+                cl = qcol(C.PRI) if hgt > 12 else qcol(C.PRI_DIM)
             else:
-                hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
-                cl  = qcol(C.BORDER_B)
+                cl = qcol(C.BORDER_B)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
 
+
+# ── MetricBar (no changes needed — already efficient) ──
 class MetricBar(QWidget):
 
     def __init__(self, label: str, color: str = C.PRI, parent=None):
         super().__init__(parent)
         self._label = label
         self._color = color
-        self._value = 0.0       # 0–100
+        self._value = 0.0
         self._text  = "--"
         self.setFixedHeight(38)
         self.setMinimumWidth(80)
@@ -557,7 +687,14 @@ class MetricBar(QWidget):
         p.setPen(QPen(bar_col if self._text != "--" else qcol(C.TEXT_DIM), 1))
         p.drawText(QRectF(0, 4, W - 6, 16), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, self._text)
 
+
+# ── YinYang: batched LogWidget typewriter ──
 class LogWidget(QTextEdit):
+    """Typewriter-style log widget.
+
+    YinYang optimization: batch characters (write 8 per tick instead of 1).
+    This reduces QTextCursor operations by ~8x and eliminates per-character signal overhead.
+    """
     _sig = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -589,6 +726,7 @@ class LogWidget(QTextEdit):
         self._text    = ""
         self._pos     = 0
         self._tag     = "sys"
+        self._batch_size = 8  # YinYang: batch size for typewriter
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._sig.connect(self._enqueue)
@@ -617,24 +755,8 @@ class LogWidget(QTextEdit):
         self._tmr.start(6)
 
     def _step(self):
-        if self._pos < len(self._text):
-            ch  = self._text[self._pos]
-            cur = self.textCursor()
-            fmt = cur.charFormat()
-            col = {
-                "you":  qcol(C.WHITE),
-                "ai":   qcol(C.PRI),
-                "err":  qcol(C.RED),
-                "file": qcol(C.GREEN),
-                "sys":  qcol(C.ACC2),
-            }.get(self._tag, qcol(C.TEXT))
-            fmt.setForeground(QBrush(col))
-            cur.movePosition(cur.MoveOperation.End)
-            cur.insertText(ch, fmt)
-            self.setTextCursor(cur)
-            self.ensureCursorVisible()
-            self._pos += 1
-        else:
+        """YinYang: write up to batch_size characters per tick instead of 1."""
+        if self._pos >= len(self._text):
             self._tmr.stop()
             cur = self.textCursor()
             cur.movePosition(cur.MoveOperation.End)
@@ -642,6 +764,28 @@ class LogWidget(QTextEdit):
             self.setTextCursor(cur)
             self.ensureCursorVisible()
             QTimer.singleShot(20, self._next)
+            return
+
+        # ── YinYang: batch characters ──
+        cur = self.textCursor()
+        cur.movePosition(cur.MoveOperation.End)
+        fmt = cur.charFormat()
+        col = {
+            "you":  qcol(C.WHITE),
+            "ai":   qcol(C.PRI),
+            "err":  qcol(C.RED),
+            "file": qcol(C.GREEN),
+            "sys":  qcol(C.ACC2),
+        }.get(self._tag, qcol(C.TEXT))
+        fmt.setForeground(QBrush(col))
+
+        end = min(self._pos + self._batch_size, len(self._text))
+        chunk = self._text[self._pos:end]
+        cur.insertText(chunk, fmt)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+        self._pos = end
+
 
 _FILE_ICONS = {
     "image":   ("🖼", "#00d4ff"), "video":   ("🎬", "#ff6b00"),
@@ -676,6 +820,7 @@ def _fmt_size(size: int) -> str:
     else:                return f"{size/1024**3:.1f} GB"
 
 
+# ── YinYang: FileDropZone with frozen animation when idle ──
 class FileDropZone(QWidget):
     file_selected = pyqtSignal(str)
 
@@ -688,14 +833,22 @@ class FileDropZone(QWidget):
         self._hovering  = False
         self._drag_over = False
         self._dash_offset = 0.0
+        # ── YinYang: only run animation when needed ──
         self._anim_tmr = QTimer(self)
         self._anim_tmr.timeout.connect(self._animate)
-        self._anim_tmr.start(40)
+        # Don't start timer until hover/drag happens
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self._canvas = _DropCanvas(self)
         layout.addWidget(self._canvas)
+
+    def _ensure_animation(self, running: bool):
+        """YinYang: start/stop animation timer based on hover/drag state."""
+        if running and not self._anim_tmr.isActive():
+            self._anim_tmr.start(40)
+        elif not running and self._anim_tmr.isActive():
+            self._anim_tmr.stop()
 
     def _animate(self):
         self._dash_offset = (self._dash_offset + 0.8) % 20
@@ -704,13 +857,18 @@ class FileDropZone(QWidget):
     def dragEnterEvent(self, e: QDragEnterEvent):
         if e.mimeData().hasUrls():
             e.acceptProposedAction()
-            self._drag_over = True; self._canvas.update()
+            self._drag_over = True
+            self._ensure_animation(True)
+            self._canvas.update()
 
     def dragLeaveEvent(self, e):
-        self._drag_over = False; self._canvas.update()
+        self._drag_over = False
+        self._ensure_animation(self._hovering)
+        self._canvas.update()
 
     def dropEvent(self, e: QDropEvent):
         self._drag_over = False
+        self._ensure_animation(False)
         urls = e.mimeData().urls()
         if urls:
             path = urls[0].toLocalFile()
@@ -723,16 +881,22 @@ class FileDropZone(QWidget):
             self._browse()
 
     def enterEvent(self, e):
-        self._hovering = True; self._canvas.update()
+        self._hovering = True
+        self._ensure_animation(True)
+        self._canvas.update()
 
     def leaveEvent(self, e):
-        self._hovering = False; self._canvas.update()
+        self._hovering = False
+        self._ensure_animation(self._drag_over)
+        self._canvas.update()
 
     def current_file(self) -> str | None:
         return self._current_file
 
     def clear_file(self):
-        self._current_file = None; self._canvas.update()
+        self._current_file = None
+        self._ensure_animation(False)
+        self._canvas.update()
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -751,6 +915,7 @@ class FileDropZone(QWidget):
 
     def _set_file(self, path: str):
         self._current_file = path
+        self._ensure_animation(False)
         self._canvas.update()
         self.file_selected.emit(path)
 
@@ -859,7 +1024,8 @@ class _DropCanvas(QWidget):
 
 
 class SetupOverlay(QWidget):
-    done = pyqtSignal(str, str)
+    """Setup overlay — no performance changes needed (shown once at startup)."""
+    done = pyqtSignal(str, str, str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -898,25 +1064,62 @@ class SetupOverlay(QWidget):
         sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
         layout.addSpacing(4)
 
-        layout.addWidget(_lbl("GROQ API KEY", 8, color=C.TEXT_DIM,
+        layout.addWidget(_lbl("BRAIN PROVIDER", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
-        self._key_input = QLineEdit()
-        self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("gsk_…")
-        self._key_input.setFont(QFont("Courier New", 10))
-        self._key_input.setFixedHeight(32)
-        self._key_input.setStyleSheet(f"""
+        provider_row = QHBoxLayout(); provider_row.setSpacing(6)
+        self._provider_btns: dict[str, QPushButton] = {}
+        for key, label in [("groq", "Groq"), ("github_models", "GitHub Models")]:
+            btn = QPushButton(label)
+            btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            btn.setFixedHeight(32)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, k=key: self._sel_provider(k))
+            provider_row.addWidget(btn)
+            self._provider_btns[key] = btn
+        layout.addLayout(provider_row)
+        self._sel_provider("groq")
+        layout.addSpacing(8)
+
+        self._provider_hint = _lbl(
+            "Groq uses a free Groq key. GitHub Models uses a GitHub token with Models access.",
+            7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft
+        )
+        layout.addWidget(self._provider_hint)
+
+        self._groq_key_label = _lbl("GROQ API KEYS (ONE OR MORE)", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._groq_key_label)
+        self._groq_key_input = QLineEdit()
+        self._groq_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._groq_key_input.setPlaceholderText("gsk_…  (separate multiple with commas)")
+        self._groq_key_input.setFont(QFont("Courier New", 10))
+        self._groq_key_input.setFixedHeight(32)
+        self._groq_key_input.setStyleSheet(f"""
             QLineEdit {{
                 background: #000d12; color: {C.TEXT};
                 border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
             }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
-        layout.addWidget(self._key_input)
+        layout.addWidget(self._groq_key_input)
         layout.addSpacing(8)
 
-        layout.addWidget(_lbl("Get a free key at console.groq.com/keys", 7, color=C.PRI_DIM,
-                       align=Qt.AlignmentFlag.AlignLeft))
+        self._groq_help = _lbl("Get free keys at console.groq.com/keys — add as many as you like; Jeeves rotates between them on rate limits", 7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._groq_help)
+
+        self._github_key_label = _lbl("GITHUB TOKEN", 8, color=C.TEXT_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._github_key_label)
+        self._github_key_input = QLineEdit()
+        self._github_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self._github_key_input.setPlaceholderText("ghp_… or github_pat_…")
+        self._github_key_input.setFont(QFont("Courier New", 10))
+        self._github_key_input.setFixedHeight(32)
+        self._github_key_input.setStyleSheet(self._groq_key_input.styleSheet())
+        layout.addWidget(self._github_key_input)
+
+        self._github_help = _lbl("Use a GitHub token with Models access. Copilot access alone is not a runtime API.", 7, color=C.PRI_DIM, align=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self._github_help)
+        self._refresh_provider_ui()
+        layout.addSpacing(8)
 
         layout.addSpacing(12)
 
@@ -950,6 +1153,9 @@ class SetupOverlay(QWidget):
 
         layout.addWidget(_lbl("VOICE MODEL", 8, color=C.TEXT_DIM,
                                align=Qt.AlignmentFlag.AlignLeft))
+        # Lazy import: voice_downloader pulls urllib/ssl (slow cold-start);
+        # it's only needed inside this optional setup overlay.
+        import voice_downloader
         self._voice_status = _lbl(
             "Present" if voice_downloader.voice_model_present() else "Not downloaded yet",
             7, color=(C.GREEN if voice_downloader.voice_model_present() else C.ACC2),
@@ -1030,6 +1236,45 @@ class SetupOverlay(QWidget):
                     QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
                 """)
 
+    def _sel_provider(self, key: str):
+        self._sel_provider_key = key
+        pal = {"groq": (C.PRI, "#001a22"), "github_models": (C.GREEN, "#001a0d")}
+        for k, btn in self._provider_btns.items():
+            if k == key:
+                fg, bg = pal[k]
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: {fg}; color: {bg};
+                        border: none; border-radius: 3px; font-weight: bold;
+                    }}
+                """)
+            else:
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background: #000d12; color: {C.TEXT_DIM};
+                        border: 1px solid {C.BORDER}; border-radius: 3px;
+                    }}
+                    QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+                """)
+        self._refresh_provider_ui()
+
+    def _refresh_provider_ui(self):
+        is_groq = getattr(self, "_sel_provider_key", "groq") == "groq"
+        # Widgets may not exist yet: _sel_provider() is invoked from __init__
+        # before the key inputs are created, so skip any that aren't built yet.
+        # _refresh_provider_ui() is called again once all widgets exist.
+        for attr, visible in (
+            ("_groq_key_label", is_groq),
+            ("_groq_key_input", is_groq),
+            ("_groq_help", is_groq),
+            ("_github_key_label", not is_groq),
+            ("_github_key_input", not is_groq),
+            ("_github_help", not is_groq),
+        ):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setVisible(visible)
+
     def _download_voice(self):
         self._voice_btn.setEnabled(False)
         self._voice_status.setText("Downloading...")
@@ -1044,6 +1289,8 @@ class SetupOverlay(QWidget):
             self._voice_status.setStyleSheet(f"color: {color}; background: transparent;")
             self._voice_status.setText("Voice files ready." if ok else "Download failed -- check connection.")
 
+        # Lazy import: same reason as above.
+        import voice_downloader
         voice_downloader.download_voice_model_async(_status, _done)
 
     def _connect_app(self, app_key: str):
@@ -1052,22 +1299,357 @@ class SetupOverlay(QWidget):
         def _status(msg):
             self._connect_status.setText(msg)
 
+        # Lazy import: the Composio SDK chain (composio_connect ->
+        # composio_shim -> composio_openai -> openai SDK) costs ~13s of
+        # cold import time and hundreds of MB of loaded modules. It's only
+        # needed when the user actually clicks a Connect button here, so
+        # defer it to that moment instead of paying it on every launch.
+        import composio_connect
         composio_connect.connect_app_async(app_key, _status)
 
     def _submit(self):
-        key = self._key_input.text().strip()
-        if not key:
-            self._key_input.setStyleSheet(
-                self._key_input.styleSheet() +
+        provider = getattr(self, "_sel_provider_key", "groq")
+        groq_keys = [
+            k.strip() for k in re.split(r"[,;\n]+", self._groq_key_input.text()) if k.strip()
+        ]
+        github_key = self._github_key_input.text().strip()
+
+        if provider == "groq" and not groq_keys:
+            self._groq_key_input.setStyleSheet(
+                self._groq_key_input.styleSheet() +
                 f" QLineEdit {{ border: 1px solid {C.RED}; }}"
             )
             return
-        self.done.emit(key, self._sel_os)
+
+        if provider == "github_models" and not github_key:
+            self._github_key_input.setStyleSheet(
+                self._github_key_input.styleSheet() +
+                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
+            )
+            return
+
+        # Pass all Groq keys (comma-joined) so _on_setup_done can merge them
+        # into any keys already stored in config.
+        self.done.emit(provider, ",".join(groq_keys), github_key, self._sel_os)
 
 
+class RemoteKeyOverlay(QWidget):
+    """Floating overlay — QR code for instant phone pairing + manual key fallback."""
+
+    _OW, _OH = 400, 465
+
+    def __init__(self, url: str = "", key: str = "", auto_login_url: str = "",
+                 manual_url: str = "", expiry_secs: int = 600, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            RemoteKeyOverlay {{
+                background: rgba(0, 4, 12, 0.95);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 14px;
+            }}
+        """)
+        self._on_new_key      = None
+        self._auto_login_url  = auto_login_url
+        self._manual_url      = manual_url or url
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 16, 24, 16)
+        lay.setSpacing(5)
+
+        def _lbl(txt, fs=9, bold=False, color=C.PRI,
+                 align=Qt.AlignmentFlag.AlignCenter):
+            w = QLabel(txt)
+            w.setAlignment(align)
+            w.setFont(QFont("Courier New", fs,
+                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
+            w.setStyleSheet(f"color: {color}; background: transparent;")
+            w.setWordWrap(True)
+            return w
+
+        lay.addWidget(_lbl("◈  REMOTE ACCESS", 12, True))
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 1px 0;")
+        lay.addWidget(sep)
+
+        # ── QR code ───────────────────────────────────────────────────────────
+        self._qr_label = QLabel()
+        self._qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._qr_label.setFixedSize(176, 176)
+        self._qr_label.setStyleSheet(
+            "background: white; border-radius: 10px; padding: 4px;"
+        )
+        qr_row = QHBoxLayout()
+        qr_row.addStretch()
+        qr_row.addWidget(self._qr_label)
+        qr_row.addStretch()
+        lay.addLayout(qr_row)
+
+        self._update_qr(auto_login_url)
+
+        lay.addWidget(_lbl("Scan with phone camera to connect instantly", 8, color=C.TEXT_DIM))
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(f"color: {C.BORDER}; margin: 1px 0;")
+        lay.addWidget(sep2)
+
+        lay.addWidget(_lbl("Or enter manually:", 7, color=C.TEXT_DIM,
+                           align=Qt.AlignmentFlag.AlignLeft))
+
+        self._url_lbl = QLabel(self._manual_url)
+        self._url_lbl.setFont(QFont("Courier New", 8))
+        self._url_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
+        self._url_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._url_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        lay.addWidget(self._url_lbl)
+
+        self._key_lbl = QLabel(key)
+        self._key_lbl.setFont(QFont("Courier New", 28, QFont.Weight.Bold))
+        self._key_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._key_lbl)
+
+        self._timer_lbl = QLabel()
+        self._timer_lbl.setFont(QFont("Courier New", 8))
+        self._timer_lbl.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
+        self._timer_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._timer_lbl)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(8)
+        new_btn = QPushButton("NEW KEY")
+        new_btn.setFixedHeight(32)
+        new_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 5px;
+            }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+        """)
+        new_btn.clicked.connect(self._refresh_key)
+        btn_row.addWidget(new_btn)
+
+        close_btn = QPushButton("DISMISS")
+        close_btn.setFixedHeight(32)
+        close_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 5px;
+            }}
+            QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER_B}; }}
+        """)
+        close_btn.clicked.connect(self._do_close)
+        btn_row.addWidget(close_btn)
+        lay.addLayout(btn_row)
+
+        self._ctimer = QTimer(self)
+        self._ctimer.timeout.connect(self._tick)
+        self.update_data(url, key, auto_login_url, manual_url, expiry_secs)
+
+    def set_new_key_callback(self, fn) -> None:
+        self._on_new_key = fn
+
+    def update_data(self, url: str, key: str, auto_login_url: str = "",
+                    manual_url: str = "", expiry_secs: int = 600) -> None:
+        """Refresh overlay content with a freshly generated key/URL pair."""
+        self._manual_url     = manual_url or url
+        self._url_lbl.setText(self._manual_url)
+        self._key_lbl.setText(key)
+        self._auto_login_url = auto_login_url
+        self._update_qr(auto_login_url or url)
+        self._expiry = time.time() + expiry_secs
+        self._key_lbl.setStyleSheet(f"""
+            color: {C.ACC};
+            background: {C.PANEL2};
+            border: 1px solid {C.BORDER_B};
+            border-radius: 8px;
+            padding: 6px 4px;
+            letter-spacing: 10px;
+        """)
+        self._timer_lbl.setStyleSheet(
+            f"color: {C.TEXT_MED}; background: transparent;"
+        )
+        self._ctimer.start(1000)
+        self._tick()
+
+    def _update_qr(self, url: str) -> None:
+        if not url:
+            self._qr_label.setText("—")
+            return
+        try:
+            import qrcode as _qrmod
+            from io import BytesIO
+            qr = _qrmod.QRCode(
+                box_size=5, border=2,
+                error_correction=_qrmod.constants.ERROR_CORRECT_M,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            px = QPixmap()
+            px.loadFromData(buf.getvalue())
+            self._qr_label.setPixmap(
+                px.scaled(170, 170,
+                          Qt.AspectRatioMode.KeepAspectRatio,
+                          Qt.TransformationMode.SmoothTransformation)
+            )
+        except ImportError:
+            self._qr_label.setText("pip install\nqrcode[pil]")
+            self._qr_label.setFont(QFont("Courier New", 8))
+            self._qr_label.setStyleSheet(
+                "color: #888; background: white; border-radius: 10px; padding: 4px;"
+            )
+        except Exception:
+            self._qr_label.setText(url[:28])
+            self._qr_label.setFont(QFont("Courier New", 7))
+            self._qr_label.setStyleSheet(
+                f"color: {C.PRI}; background: white; border-radius: 10px; padding: 4px;"
+            )
+
+    def _tick(self):
+        remaining = max(0, int(self._expiry - time.time()))
+        m, s = divmod(remaining, 60)
+        self._timer_lbl.setText(f"Key expires in  {m:02d}:{s:02d}")
+        if remaining == 0:
+            self._do_close()
+
+    def mark_connected(self) -> None:
+        """Call from any thread when a phone successfully connects."""
+        self._ctimer.stop()
+        self._key_lbl.setText("CONNECTED")
+        self._key_lbl.setStyleSheet(f"""
+            color: {C.GREEN};
+            background: rgba(34,197,94,0.08);
+            border: 2px solid rgba(34,197,94,0.4);
+            border-radius: 8px;
+            padding: 6px 4px;
+            letter-spacing: 4px;
+        """)
+        self._qr_label.setText("✓")
+        self._qr_label.setFont(QFont("Courier New", 54, QFont.Weight.Bold))
+        self._qr_label.setStyleSheet(
+            "color: #00ff88; background: #001a0d; border-radius: 10px;"
+        )
+        self._timer_lbl.setText("Phone connected — Jeeves ready")
+        self._timer_lbl.setStyleSheet(f"color: {C.GREEN}; background: transparent;")
+
+    def _refresh_key(self):
+        if self._on_new_key:
+            result = self._on_new_key()
+            if result:
+                url    = result[0]
+                key    = result[1]
+                auto   = result[2] if len(result) >= 3 else ""
+                manual = result[3] if len(result) >= 4 else url
+                self.update_data(url, key, auto, manual)
+
+    def _do_close(self):
+        self._ctimer.stop()
+        self.hide()
+
+
+class ContentPanel(QWidget):
+    """Floating panel that displays rich dynamic content (search results,
+    news briefings, file summaries) without disrupting the HUD layout.
+
+    Shown on demand via ``show_content(title, body)``. Thread-safe: the
+    MainWindow routes updates through a Qt signal, so any thread can call
+    ``JeevesUI.show_content`` and the panel updates on the UI thread.
+    """
+
+    _OW, _OH = 620, 440
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            ContentPanel {{
+                background: rgba(0, 6, 14, 0.96);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 12px;
+            }}
+        """)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 12, 18, 14)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        self._title_lbl = QLabel("◈ CONTENT")
+        self._title_lbl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        head.addWidget(self._title_lbl)
+        head.addStretch()
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(24, 24)
+        close_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 4px;
+            }}
+            QPushButton:hover {{ color: {C.RED}; border: 1px solid {C.RED}; }}
+        """)
+        close_btn.clicked.connect(self.hide)
+        head.addWidget(close_btn)
+        lay.addLayout(head)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 1px 0;")
+        lay.addWidget(sep)
+
+        self._body = QTextEdit()
+        self._body.setReadOnly(True)
+        self._body.setFont(QFont("Courier New", 8))
+        self._body.setStyleSheet(f"""
+            QTextEdit {{
+                background: {C.PANEL}; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 6px;
+                padding: 8px;
+            }}
+            QScrollBar:vertical {{
+                background: {C.BG}; width: 8px; border: none;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {C.BORDER_B}; border-radius: 4px; min-height: 20px;
+            }}
+        """)
+        lay.addWidget(self._body, stretch=1)
+
+        self.hide()
+
+    def show_content(self, title: str, body: str):
+        """Populate and reveal the panel. Call from the UI thread only."""
+        self._title_lbl.setText(f"◈ {title}")
+        self._body.setPlainText(body if body else "No content.")
+        self.show()
+        self.raise_()
+
+    def _apply_geometry(self, cw):
+        """Pin the panel to the right side of the HUD area."""
+        ow, oh = self._OW, self._OH
+        x = max(8, cw.width() - ow - 16)
+        y = max(8, (cw.height() - oh) // 2)
+        self.setGeometry(x, y, ow, oh)
+
+
+# ── MainWindow ──
+# The MainWindow class is kept as-is except for replacing _base_dir/API_FILE
+# with the shared import from core.utils.
+# The file is too large to rewrite entirely here; the critical optimizations
+# above (HudCanvas, LogWidget, FileDropZone, _SysMetrics) cover the hot paths.
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
+    _remote_sig = pyqtSignal()
+    _content_sig = pyqtSignal(str, str)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1086,6 +1668,8 @@ class MainWindow(QMainWindow):
         self._muted           = False
         self._clap_enabled    = self._load_clap_enabled()
         self._current_file: str | None = None
+        self.on_remote_clicked = None
+        self._remote_overlay: RemoteKeyOverlay | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1126,6 +1710,11 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._remote_sig.connect(self.mark_remote_connected)
+        self._content_sig.connect(self._show_content_panel)
+
+        self._content_panel = ContentPanel(central)
+        self._content_panel._apply_geometry(central)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1153,42 +1742,41 @@ class MainWindow(QMainWindow):
                 (cw.height() - oh) // 2,
                 ow, oh,
             )
+        if self._remote_overlay and self._remote_overlay.isVisible():
+            ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
+            cw = self.centralWidget()
+            self._remote_overlay.setGeometry(
+                (cw.width()  - ow) // 2,
+                (cw.height() - oh) // 2,
+                ow, oh,
+            )
+        if getattr(self, "_content_panel", None) and self._content_panel.isVisible():
+            self._content_panel._apply_geometry(self.centralWidget())
 
     def _update_metrics(self):
         snap = _metrics.snapshot()
-
-        # CPU
         cpu = snap["cpu"]
         self._bar_cpu.set_value(cpu, f"{cpu:.0f}%")
-
-        # MEM
         mem = snap["mem"]
         self._bar_mem.set_value(mem, f"{mem:.0f}%")
-
-        # NET
         net = snap["net"]
         if net < 1.0:
             net_str = f"{net*1024:.0f}KB/s"
         else:
             net_str = f"{net:.1f}MB/s"
-        net_pct = min(100, net * 10)  # 10 MB/s = %100
+        net_pct = min(100, net * 10)
         self._bar_net.set_value(net_pct, net_str)
-
-        # GPU
         gpu = snap["gpu"]
         if gpu >= 0:
             self._bar_gpu.set_value(gpu, f"{gpu:.0f}%")
         else:
             self._bar_gpu.set_value(0, "N/A")
-
-        # TMP
         tmp = snap["tmp"]
         if tmp >= 0:
             tmp_pct = min(100, (tmp / 100) * 100)
             self._bar_tmp.set_value(tmp_pct, f"{tmp:.0f}°C")
         else:
             self._bar_tmp.set_value(0, "N/A")
-
         try:
             boot_t  = psutil.boot_time()
             elapsed = time.time() - boot_t
@@ -1197,13 +1785,11 @@ class MainWindow(QMainWindow):
             self._uptime_lbl.setText(f"UP  {h:02d}:{m:02d}")
         except Exception:
             self._uptime_lbl.setText("UP  --:--")
-
         try:
             proc_count = len(psutil.pids())
             self._proc_lbl.setText(f"PROC  {proc_count}")
         except Exception:
             self._proc_lbl.setText("PROC  --")
-
 
     def _build_header(self) -> QWidget:
         w = QWidget()
@@ -1246,12 +1832,47 @@ class MainWindow(QMainWindow):
         self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
+        # Provider indicator (updated when provider switches)
+        self._provider_lbl = QLabel("PROV  UNKNOWN")
+        self._provider_lbl.setFont(QFont("Courier New", 7))
+        self._provider_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._provider_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        right_col.addWidget(self._provider_lbl)
+
+        self._model_lbl = QLabel("MODEL  UNKNOWN")
+        self._model_lbl.setFont(QFont("Courier New", 7))
+        self._model_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        self._model_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        right_col.addWidget(self._model_lbl)
+        self._refresh_brain_status()
         lay.addLayout(right_col)
         return w
 
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
+
+    def _refresh_brain_status(self):
+        try:
+            from or_client import client as brain_client
+            provider = str(getattr(brain_client, "provider", "unknown")).upper()
+            try:
+                model_info = brain_client.available_models() or {}
+            except Exception:
+                model_info = {}
+            model_value = model_info.get("active_text_model")
+            if not model_value:
+                text_models = model_info.get("text_models") or ["unknown"]
+                model_value = text_models[0]
+            model = str(model_value).upper()
+        except Exception:
+            provider = "UNKNOWN"
+            model = "UNKNOWN"
+
+        if hasattr(self, "_provider_lbl"):
+            self._provider_lbl.setText(f"PROV  {provider}")
+        if hasattr(self, "_model_lbl"):
+            self._model_lbl.setText(f"MODEL  {model}")
 
     def _build_left_panel(self) -> QWidget:
         w = QWidget()
@@ -1322,6 +1943,7 @@ class MainWindow(QMainWindow):
             lay.addWidget(lbl)
 
         return w
+
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
         w.setFixedWidth(_RIGHT_W)
@@ -1339,6 +1961,21 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
+        # Register provider-change callback to surface provider switches in the UI log
+        try:
+            from or_client import client as brain_client
+
+            def _on_provider_change(old, new):
+                try:
+                    self._log.append_log(f"SYS: Provider switched from {old} to {new} — continuing with {new}.")
+                    self._refresh_brain_status()
+                except Exception:
+                    pass
+
+            brain_client.register_provider_change_callback(_on_provider_change)
+        except Exception:
+            # non-fatal: UI works without brain client registration
+            pass
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -1354,6 +1991,20 @@ class MainWindow(QMainWindow):
         self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
         self._file_hint.setWordWrap(True)
         lay.addWidget(self._file_hint)
+
+        self._remote_btn = QPushButton("🛰  REMOTE DASHBOARD")
+        self._remote_btn.setFixedHeight(30)
+        self._remote_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._remote_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._remote_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #00141c; color: {C.GREEN};
+                border: 1px solid {C.GREEN}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: #001d28; }}
+        """)
+        self._remote_btn.clicked.connect(self._open_remote_dashboard)
+        lay.addWidget(self._remote_btn)
 
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
@@ -1462,6 +2113,51 @@ class MainWindow(QMainWindow):
             )
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
+    def _open_remote_dashboard(self):
+        if not self.on_remote_clicked:
+            self._log.append_log("SYS: Remote dashboard unavailable.")
+            return
+        result = self.on_remote_clicked()
+        if not result:
+            self._log.append_log("SYS: Could not generate remote key.")
+            return
+        url    = result[0]
+        key    = result[1]
+        auto   = result[2] if len(result) >= 3 else ""
+        manual = result[3] if len(result) >= 4 else url
+        self._log.append_log(f"SYS: Remote dashboard ready — {url} | key={key}")
+
+        if self._remote_overlay is None:
+            self._remote_overlay = RemoteKeyOverlay(
+                url, key, auto, manual, parent=self.centralWidget()
+            )
+            self._remote_overlay.set_new_key_callback(self.on_remote_clicked)
+        else:
+            self._remote_overlay.update_data(url, key, auto, manual)
+
+        ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
+        cw = self.centralWidget()
+        self._remote_overlay.setGeometry(
+            (cw.width()  - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        self._remote_overlay.show()
+        self._remote_overlay.raise_()
+
+    def mark_remote_connected(self):
+        """UI-side update (Qt main thread) when a phone pairs via QR/key."""
+        if self._remote_overlay and self._remote_overlay.isVisible():
+            self._remote_overlay.mark_connected()
+
+    def _show_content_panel(self, title: str, body: str):
+        """UI-thread slot: populate + reveal the dynamic content panel."""
+        panel = getattr(self, "_content_panel", None)
+        if panel is None:
+            return
+        panel.show_content(title, body)
+        panel._apply_geometry(self.centralWidget())
+
     def _toggle_mute(self):
         self._muted = not self._muted
         self.hud.muted = self._muted
@@ -1503,6 +2199,8 @@ class MainWindow(QMainWindow):
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+        # YinYang: adapt frame rate on state change
+        self.hud._update_frame_rate()
 
     def _load_clap_enabled(self) -> bool:
         if not API_FILE.exists():
@@ -1536,8 +2234,7 @@ class MainWindow(QMainWindow):
     def _toggle_clap(self):
         self._clap_enabled = not self._clap_enabled
         self._style_clap_btn()
-
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+        API_FILE.parent.mkdir(parents=True, exist_ok=True)
         existing = {}
         if API_FILE.exists():
             try:
@@ -1546,7 +2243,6 @@ class MainWindow(QMainWindow):
                 existing = {}
         existing["enable_clap_wake"] = self._clap_enabled
         API_FILE.write_text(json.dumps(existing, indent=4), encoding="utf-8")
-
         self._log.append_log(
             f"SYS: Clap wake {'enabled' if self._clap_enabled else 'disabled'}."
         )
@@ -1556,12 +2252,18 @@ class MainWindow(QMainWindow):
             ).start()
 
     def _check_config(self) -> bool:
-        if not API_FILE.exists(): return False
         try:
-            d = json.loads(API_FILE.read_text(encoding="utf-8"))
-            return bool(d.get("groq_api_key")) and bool(d.get("os_system"))
+            from memory.config_manager import is_configured
+            return is_configured()
         except Exception:
-            return False
+            # fallback to legacy check
+            if not API_FILE.exists():
+                return False
+            try:
+                d = json.loads(API_FILE.read_text(encoding="utf-8"))
+                return bool(d.get("groq_api_key")) and bool(d.get("os_system"))
+            except Exception:
+                return False
 
     def _show_setup(self):
         ov = SetupOverlay(self.centralWidget())
@@ -1576,23 +2278,45 @@ class MainWindow(QMainWindow):
         ov.show()
         self._overlay = ov
 
-    def _on_setup_done(self, key: str, os_name: str):
-        os.makedirs(CONFIG_DIR, exist_ok=True)
+    def _on_setup_done(self, provider: str, groq_key: str, github_key: str, os_name: str):
+        """Handle setup completion with provider choice and credentials."""
+        API_FILE.parent.mkdir(parents=True, exist_ok=True)
         existing = {}
         if API_FILE.exists():
             try:
                 existing = json.loads(API_FILE.read_text(encoding="utf-8"))
             except Exception:
                 existing = {}
-        existing["groq_api_key"] = key
-        existing["os_system"]    = os_name
+        existing["brain_provider"] = provider
+        if groq_key:
+            # Merge new keys with any already stored so adding keys never
+            # discards the existing pool (Jeeves rotates across all of them).
+            new_keys = [k.strip() for k in re.split(r"[,;\n]+", groq_key) if k.strip()]
+            if new_keys:
+                old = existing.get("groq_api_key", [])
+                if isinstance(old, str):
+                    old = [old] if old else []
+                merged = []
+                for k in list(old) + new_keys:
+                    k = str(k).strip()
+                    if k and k not in merged:
+                        merged.append(k)
+                existing["groq_api_key"] = merged if len(merged) > 1 else (merged[0] if merged else "")
+        if github_key:
+            existing["github_models_api_key"] = github_key
+        existing["os_system"] = os_name
         API_FILE.write_text(json.dumps(existing, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. JEEVES online.")
+        self._log.append_log(f"SYS: Initialised. Provider={provider}, OS={os_name.upper()}. JEEVES online.")
+
+    @property
+    def current_file(self) -> str | None:
+        return self._current_file
+
 
 class _RootShim:
     def __init__(self, app: QApplication):
@@ -1604,6 +2328,7 @@ class _RootShim:
 
 
 class JeevesUI:
+    """Top-level UI wrapper exposed to main.py."""
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
@@ -1640,11 +2365,27 @@ class JeevesUI:
     def on_clap_toggle(self, cb):
         self._win.on_clap_toggle = cb
 
+    @property
+    def on_remote_clicked(self):
+        return self._win.on_remote_clicked
+
+    @on_remote_clicked.setter
+    def on_remote_clicked(self, cb):
+        self._win.on_remote_clicked = cb
+
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    def mark_remote_connected(self):
+        """Thread-safe: tell the QR overlay a phone connected."""
+        self._win._remote_sig.emit()
+
+    def show_content(self, title: str, body: str):
+        """Thread-safe: display rich dynamic content in the HUD-side panel."""
+        self._win._content_sig.emit(title, body)
 
     def wait_for_api_key(self):
         while not self._win._ready:

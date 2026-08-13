@@ -10,21 +10,11 @@ from typing import Callable
 
 from agent.planner       import create_plan, replan
 from agent.error_handler import analyze_error, generate_fix, ErrorDecision
+from actions.remote_runner import remote_execution_enabled, run_python_text
+
+from core.utils import get_base_dir, BASE_DIR
 
 
-def get_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-
-BASE_DIR        = get_base_dir()
-API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
-
-
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
 
 def _run_generated_code(description: str, speak: Callable | None = None) -> str:
     if speak:
@@ -45,8 +35,9 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
             pass
 
     from or_client import ClaudeModelShim
+    from or_client import GROQ_DEFAULT_MODEL as _HEAVY_MODEL
     model = ClaudeModelShim(
-        model_name="claude-sonnet-5",
+        model_name=_HEAVY_MODEL,
         system_instruction=(
             "You are an expert Python developer. "
             "Write clean, complete, working Python code. "
@@ -67,6 +58,10 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
         )
         code = response.text.strip()
         code = re.sub(r"```(?:python)?", "", code).strip().rstrip("`").strip()
+
+        if remote_execution_enabled():
+            print("[Executor] 🌐 Running generated code on remote shell")
+            return run_python_text(code)
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".py", delete=False, encoding="utf-8"
@@ -105,6 +100,8 @@ def _run_generated_code(description: str, speak: Callable | None = None) -> str:
     except Exception as e:
         raise RuntimeError(f"Generated code failed: {e}")
 
+
+
 def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "") -> dict:
     if not step_results:
         return params
@@ -127,7 +124,8 @@ def _inject_context(params: dict, tool: str, step_results: dict, goal: str = "")
     return params
 def _detect_language(text: str) -> str:
     from or_client import ClaudeModelShim
-    model = ClaudeModelShim(model_name="claude-haiku-4-5-20251001")
+    from or_client import GROQ_LITE_MODEL as _FAST_MODEL
+    model = ClaudeModelShim(model_name=_FAST_MODEL)
     try:
         response = model.generate_content(
             f"What language is this text written in? "
@@ -144,7 +142,7 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
         return content
     try:
         from or_client import ClaudeModelShim
-        model = ClaudeModelShim(model_name="claude-sonnet-5")
+        model = ClaudeModelShim()
 
         target_lang = _detect_language(goal)
         print(f"[Executor] 🌐 Translating to: {target_lang}")
@@ -168,83 +166,107 @@ def _translate_to_goal_language(content: str, goal: str) -> str:
         return content
 
 def _call_tool(tool: str, parameters: dict, speak: Callable | None) -> str:
+    try:
+        if tool == "open_app":
+            from actions.open_app import open_app
+            return open_app(parameters=parameters, player=None) or "Done."
 
-    if tool == "open_app":
-        from actions.open_app import open_app
-        return open_app(parameters=parameters, player=None) or "Done."
+        elif tool == "web_search":
+            from actions.web_search import web_search
+            return web_search(parameters=parameters, player=None) or "Done."
 
-    elif tool == "web_search":
-        from actions.web_search import web_search
-        return web_search(parameters=parameters, player=None) or "Done."
-    elif tool == "game_updater":
-        from actions.game_updater import game_updater
-        return game_updater(parameters=parameters, player=None, speak=speak) or "Done."
-    elif tool == "browser_control":
-        from actions.browser_control import browser_control
-        return browser_control(parameters=parameters, player=None) or "Done."
+        elif tool == "game_updater":
+            from actions.game_updater import game_updater
+            return game_updater(parameters=parameters, player=None, speak=speak) or "Done."
 
-    elif tool == "file_controller":
-        from actions.file_controller import file_controller
-        return file_controller(parameters=parameters, player=None) or "Done."
+        elif tool == "browser_control":
+            from actions.browser_control import browser_control
+            return browser_control(parameters=parameters, player=None) or "Done."
 
-    elif tool == "cmd_control":
-        from actions.cmd_control import cmd_control
-        return cmd_control(parameters=parameters, player=None) or "Done."
+        elif tool == "file_controller":
+            from actions.file_controller import file_controller
+            return file_controller(parameters=parameters, player=None) or "Done."
 
-    elif tool == "code_helper":
-        from actions.code_helper import code_helper
-        return code_helper(parameters=parameters, player=None, speak=speak) or "Done."
+        elif tool == "cmd_control":
+            from actions.cmd_control import cmd_control
+            return cmd_control(parameters=parameters, player=None) or "Done."
 
-    elif tool == "dev_agent":
-        from actions.dev_agent import dev_agent
-        return dev_agent(parameters=parameters, player=None, speak=speak) or "Done."
+        elif tool == "code_helper":
+            from actions.code_helper import code_helper
+            return code_helper(parameters=parameters, player=None, speak=speak) or "Done."
 
-    elif tool == "screen_process":
-        from actions.screen_processor import screen_process
-        screen_process(parameters=parameters, player=None)
-        return "Screen captured and analyzed."
+        elif tool == "dev_agent":
+            from actions.dev_agent import dev_agent
+            return dev_agent(parameters=parameters, player=None, speak=speak) or "Done."
 
-    elif tool == "send_message":
-        from actions.send_message import send_message
-        return send_message(parameters=parameters, player=None) or "Done."
+        elif tool == "screen_process":
+            from actions.screen_processor import screen_process
+            screen_process(parameters=parameters, player=None)
+            return "Screen captured and analyzed."
 
-    elif tool == "reminder":
-        from actions.reminder import reminder
-        return reminder(parameters=parameters, player=None) or "Done."
+        elif tool == "send_message":
+            from actions.send_message import send_message
+            return send_message(parameters=parameters, player=None) or "Done."
 
-    elif tool == "youtube_video":
-        from actions.youtube_video import youtube_video
-        return youtube_video(parameters=parameters, player=None) or "Done."
+        elif tool == "reminder":
+            from actions.reminder import reminder
+            return reminder(parameters=parameters, player=None) or "Done."
 
-    elif tool == "weather_report":
-        from actions.weather_report import weather_action
-        return weather_action(parameters=parameters, player=None) or "Done."
+        elif tool == "youtube_video":
+            from actions.youtube_video import youtube_video
+            return youtube_video(parameters=parameters, player=None) or "Done."
 
-    elif tool == "computer_settings":
-        from actions.computer_settings import computer_settings
-        return computer_settings(parameters=parameters, player=None) or "Done."
+        elif tool == "weather_report":
+            from actions.weather_report import weather_action
+            return weather_action(parameters=parameters, player=None) or "Done."
 
-    elif tool == "desktop_control":
-        from actions.desktop import desktop_control
-        return desktop_control(parameters=parameters, player=None) or "Done."
+        elif tool == "computer_settings":
+            from actions.computer_settings import computer_settings
+            return computer_settings(parameters=parameters, player=None) or "Done."
 
-    elif tool == "computer_control":
-        from actions.computer_control import computer_control
-        return computer_control(parameters=parameters, player=None) or "Done."
+        elif tool == "desktop_control":
+            from actions.desktop import desktop_control
+            return desktop_control(parameters=parameters, player=None) or "Done."
 
-    elif tool == "generated_code":
-        description = parameters.get("description", "")
-        if not description:
-            raise ValueError("generated_code requires a 'description' parameter.")
-        return _run_generated_code(description, speak=speak)
+        elif tool == "computer_control":
+            from actions.computer_control import computer_control
+            return computer_control(parameters=parameters, player=None) or "Done."
 
-    elif tool == "flight_finder":
-        from actions.flight_finder import flight_finder
-        return flight_finder(parameters=parameters, player=None, speak=speak) or "Done."
+        elif tool == "generated_code":
+            description = parameters.get("description", "")
+            if not description:
+                raise ValueError("generated_code requires a 'description' parameter.")
+            return _run_generated_code(description, speak=speak)
 
-    else:
-        print(f"[Executor] ⚠️ Unknown tool '{tool}' — falling back to generated_code")
-        return _run_generated_code(f"Accomplish this task: {parameters}", speak=speak)
+        elif tool == "flight_finder":
+            from actions.flight_finder import flight_finder
+            return flight_finder(parameters=parameters, player=None, speak=speak) or "Done."
+
+        else:
+            print(f"[Executor] ⚠️ Unknown tool '{tool}' — falling back to generated_code")
+            return _run_generated_code(f"Accomplish this task: {parameters}", speak=speak)
+    except Exception as exc:
+        print(f"[Executor] ⚠️ Tool execution failed for '{tool}': {exc}")
+        return f"Tool execution failed for '{tool}': {exc}"
+
+
+def _invoke_agent(agent_name: str, step: dict, error: str) -> str:
+    try:
+        agent_script = BASE_DIR / "doctor.py"
+        if agent_name.lower() in ("doctor", "doctor_strange", "doctor strange") and agent_script.exists():
+            print(f"[Executor] 🩺 Invoking agent: {agent_name}")
+            result = subprocess.run(
+                [sys.executable, str(agent_script)],
+                capture_output=True, text=True, cwd=str(BASE_DIR), timeout=30
+            )
+            out = (result.stdout or "").strip()
+            err = (result.stderr or "").strip()
+            report = out or err or "(no output)"
+            return report
+        return ""
+    except Exception as e:
+        print(f"[Executor] ⚠️ Agent invocation failed: {e}")
+        return f"Agent invocation failed: {e}"
 
 class AgentExecutor:
 
@@ -309,6 +331,15 @@ class AgentExecutor:
 
                         recovery = analyze_error(step, error_msg, attempt=attempt)
                         decision = recovery["decision"]
+                        # If the error analyst recommends replan/abort, invoke Doctor Strange for deeper diagnostics
+                        if decision in (ErrorDecision.REPLAN, ErrorDecision.ABORT):
+                            try:
+                                agent_report = _invoke_agent("doctor_strange", step, error_msg)
+                                recovery["agent_report"] = agent_report
+                                if agent_report and speak:
+                                    speak("Consulted diagnostics specialist for details, sir.")
+                            except Exception:
+                                pass
                         user_msg = recovery.get("user_message", "")
 
                         if speak and user_msg:
@@ -326,7 +357,11 @@ class AgentExecutor:
                             break
 
                         elif decision == ErrorDecision.ABORT:
-                            msg = f"Task aborted, sir. {recovery.get('reason', '')}"
+                            reason = recovery.get('reason', '')
+                            agent_report = recovery.get('agent_report', '')
+                            msg = f"Task aborted, sir. {reason}"
+                            if agent_report:
+                                msg += f"\n\nDiagnostics:\n{agent_report[:2000]}"
                             if speak: speak(msg)
                             return msg
 
@@ -349,7 +384,11 @@ class AgentExecutor:
                                     print(f"[Executor] ⚠️ Fix failed: {fix_err}")
 
                             failed_step  = step
-                            failed_error = error_msg
+                            agent_report = recovery.get('agent_report', '')
+                            if agent_report:
+                                failed_error = f"{error_msg}\n\nDiagnostics:\n{agent_report[:2000]}"
+                            else:
+                                failed_error = error_msg
                             success      = False
                             break
 
@@ -377,8 +416,8 @@ class AgentExecutor:
     def _summarize(self, goal: str, completed_steps: list, speak: Callable | None) -> str:
         fallback = f"All done, sir. Completed {len(completed_steps)} steps for: {goal[:60]}."
         try:
-            from or_client import ClaudeModelShim
-            model     = ClaudeModelShim(model_name="claude-haiku-4-5-20251001")
+            from or_client import ClaudeModelShim, GROQ_LITE_MODEL
+            model = ClaudeModelShim(model_name=GROQ_LITE_MODEL)
             steps_str = "\n".join(f"- {s.get('description', '')}" for s in completed_steps)
             prompt    = (
                 f'User goal: "{goal}"\n'

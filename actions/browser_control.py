@@ -5,7 +5,19 @@ import platform
 import shutil
 import subprocess
 from pathlib import Path
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+
+# playwright is heavy (~1.4s cold import) and only needed when a browser
+# session is actually started — loaded lazily on first use (PEP 562).
+_playwright_api = None
+
+def __getattr__(name: str):
+    global _playwright_api
+    if name in ("async_playwright", "PlaywrightTimeout"):
+        if _playwright_api is None:
+            from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+            _playwright_api = (async_playwright, PlaywrightTimeout)
+        return _playwright_api[0] if name == "async_playwright" else _playwright_api[1]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _get_default_browser_id() -> str:
@@ -144,9 +156,83 @@ def _find_browser_executable(prog_id: str) -> tuple:
     return "chromium", None, None, False
 
 
+def _resolve_browser(browser: str) -> tuple:
+    """Map a user-facing browser name → (engine, exe_path, channel, is_opera).
+
+    Supports: chrome, edge, firefox, brave, opera, vivaldi, safari.
+    Unknown names fall back to the system default browser detection.
+    """
+    name = (browser or "").lower().strip()
+    system  = platform.system()
+    os_bins = _BROWSER_BINARIES.get(system, {})
+
+    if not name:
+        prog_id = _get_default_browser_id()
+        return _find_browser_executable(prog_id)
+
+    if name in ("safari", "webkit"):
+        return "webkit", None, None, False
+    if name in ("firefox", "mozilla"):
+        return "firefox", None, None, False
+    if name == "edge":
+        return "chromium", None, "msedge", False
+    if name == "opera":
+        exe = _get_opera_executable()
+        if exe:
+            return "chromium", exe, None, True
+        for binary in os_bins.get("opera", []):
+            path = shutil.which(binary)
+            if path:
+                return "chromium", path, None, True
+        return "chromium", None, None, True
+    if name in ("brave", "vivaldi", "chrome"):
+        binaries = os_bins.get(name, [])
+        for binary in binaries:
+            path = shutil.which(binary)
+            if path:
+                return "chromium", path, None, False
+        # Built-in channel fallback for chrome
+        return "chromium", None, ("chrome" if name == "chrome" else None), False
+
+    # Unknown → system default
+    prog_id = _get_default_browser_id()
+    return _find_browser_executable(prog_id)
+
+
+def _list_available_browsers() -> list[str]:
+    """Return the names of browsers found on this machine."""
+    system = platform.system()
+    os_bins = _BROWSER_BINARIES.get(system, {})
+    found = []
+    for name, binaries in os_bins.items():
+        for binary in binaries:
+            if shutil.which(binary):
+                found.append(name)
+                break
+    if system == "Windows":
+        try:
+            import winreg
+            for prog in [r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe"]:
+                try:
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, prog)
+                    winreg.CloseKey(key)
+                    found.append("edge")
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if system == "Darwin":
+        # Safari ships with macOS by default
+        found.append("safari")
+    # De-duplicate, keep stable order
+    return list(dict.fromkeys(found))
+
+
 class _BrowserThread:
 
-    def __init__(self):
+    def __init__(self, browser_name: str = ""):
+        self._browser_name = (browser_name or "").lower().strip()
         self._loop       = None
         self._thread     = None
         self._ready      = threading.Event()
@@ -158,20 +244,35 @@ class _BrowserThread:
         self._exe_path   = None
         self._channel    = None
         self._is_opera   = False
+        self._init_error = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
             return
+        self._init_error = None
         self._thread = threading.Thread(
             target=self._run_loop, daemon=True, name="BrowserThread"
         )
         self._thread.start()
-        self._ready.wait(timeout=15)
+        if not self._ready.wait(timeout=15):
+            # Init neither succeeded nor failed within the window — raise
+            # instead of leaving a half-dead thread that hangs every call.
+            raise RuntimeError(
+                f"Browser thread did not initialize within 15s "
+                f"(last error: {self._init_error})"
+            )
+        if self._init_error:
+            raise RuntimeError(f"Browser failed to start: {self._init_error}")
 
     def _run_loop(self):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
-        self._loop.run_until_complete(self._init())
+        try:
+            self._loop.run_until_complete(self._init())
+        except Exception as e:  # surface init failure instead of dying silently
+            self._init_error = str(e)
+            self._ready.set()
+            return
         self._ready.set()
         self._loop.run_forever()
 
@@ -179,7 +280,9 @@ class _BrowserThread:
         self._playwright = await async_playwright().start()
 
     def run(self, coro, timeout: int = 30):
-        if not self._loop:
+        if self._init_error:
+            raise RuntimeError(f"Browser unavailable: {self._init_error}")
+        if not self._loop or not (self._thread and self._thread.is_alive()):
             raise RuntimeError("BrowserThread not started.")
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=timeout)
@@ -189,13 +292,19 @@ class _BrowserThread:
     async def _launch_browser_if_needed(self):
         """
         Tarayıcıyı başlatır. Zaten açıksa hiçbir şey yapmaz.
-        Her zaman default tarayıcıyı kullanır, özel sekme açmaz.
+        Belirtilen tarayıcıyı kullanır (browser_name), yoksa sistem
+        varsayılanını kullanır. Özel sekme açmaz.
         """
         if self._browser and self._browser.is_connected():
             return
 
-        prog_id = _get_default_browser_id()
-        self._engine_name, self._exe_path, self._channel, self._is_opera = _find_browser_executable(prog_id)
+        if self._browser_name:
+            self._engine_name, self._exe_path, self._channel, self._is_opera = \
+                _resolve_browser(self._browser_name)
+        else:
+            prog_id = _get_default_browser_id()
+            self._engine_name, self._exe_path, self._channel, self._is_opera = \
+                _find_browser_executable(prog_id)
         engine = getattr(self._playwright, self._engine_name)
 
         # Temel chromium argümanları
@@ -408,19 +517,54 @@ class _BrowserThread:
         return "Browser closed."
 
 
-# ── Singleton browser thread ─────────────────────────────────────────────────
+# ── Browser thread registry (one thread per named browser) ───────────────────
+# Enables simultaneous browsers: each distinct browser name gets its own
+# Playwright thread + window, while the anonymous default keeps the old
+# singleton behaviour.
 
-_bt         = _BrowserThread()
-_bt_started = False
-_bt_lock    = threading.Lock()
+_bt_lock        = threading.Lock()
+_browser_threads: dict[str, _BrowserThread] = {}
 
 
-def _ensure_started():
-    global _bt_started
+def _get_thread(browser: str = "") -> _BrowserThread:
+    """Return (creating if needed) the thread for a given browser name.
+
+    Empty string → the shared default thread (system default browser).
+
+    start() can block up to 15s waiting for Playwright init, so it runs
+    OUTSIDE _bt_lock — otherwise close_all() would stall behind it.
+    """
+    key = (browser or "").lower().strip()
     with _bt_lock:
-        if not _bt_started:
-            _bt.start()
-            _bt_started = True
+        if key in _browser_threads:
+            return _browser_threads[key]
+        t = _BrowserThread(browser_name=key)
+    t.start()  # may raise RuntimeError on init failure; thread NOT registered
+    with _bt_lock:
+        _browser_threads[key] = t
+    return t
+
+
+# Backwards-compatible default singleton
+def _ensure_started():
+    _get_thread("")
+
+
+def _close_all_browsers() -> str:
+    """Close every browser instance (default + any named ones)."""
+    with _bt_lock:
+        names = list(_browser_threads.keys())
+    msgs = []
+    for key in names:
+        try:
+            t = _browser_threads.get(key)
+            if t:
+                msgs.append(t.run(t._close_browser()))
+        except Exception as e:
+            msgs.append(f"{key or 'default'}: {e}")
+    with _bt_lock:
+        _browser_threads.clear()
+    return "; ".join(msgs) if msgs else "No browsers open."
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -437,7 +581,10 @@ def browser_control(
 
     parameters:
         action      : go_to | search | click | type | scroll | fill_form |
-                      smart_click | smart_type | get_text | press | close
+                      smart_click | smart_type | get_text | press | close |
+                      list | close_all
+        browser     : chrome | edge | firefox | brave | opera | vivaldi |
+                      safari (default: system default browser)
         url         : URL for go_to
         query       : search query
         engine      : google | bing | duckduckgo (default: google)
@@ -450,60 +597,72 @@ def browser_control(
         fields      : {selector: value} dict for fill_form
         clear_first : bool, clear input before typing (default: True)
     """
-    _ensure_started()
-
-    action = (parameters or {}).get("action", "").lower().strip()
+    params = parameters or {}
+    action = (params.get("action", "") or "").lower().strip()
+    browser = (params.get("browser", "") or "").lower().strip()
     result = "Unknown action."
 
     try:
+        if action == "list":
+            available = _list_available_browsers()
+            if available:
+                return "Available browsers: " + ", ".join(available)
+            return "No browsers detected. " \
+                   "Pass a 'browser' param (chrome, edge, firefox...)."
+
+        if action == "close_all":
+            return _close_all_browsers()
+
+        bt = _get_thread(browser)
+
         if action == "go_to":
-            result = _bt.run(_bt._go_to(parameters.get("url", "")))
+            result = bt.run(bt._go_to(params.get("url", "")))
 
         elif action == "search":
-            result = _bt.run(_bt._search(
-                parameters.get("query", ""),
-                parameters.get("engine", "google"),
+            result = bt.run(bt._search(
+                params.get("query", ""),
+                params.get("engine", "google"),
             ))
 
         elif action == "click":
-            result = _bt.run(_bt._click(
-                selector=parameters.get("selector"),
-                text=parameters.get("text"),
+            result = bt.run(bt._click(
+                selector=params.get("selector"),
+                text=params.get("text"),
             ))
 
         elif action == "type":
-            result = _bt.run(_bt._type(
-                selector=parameters.get("selector"),
-                text=parameters.get("text", ""),
-                clear_first=parameters.get("clear_first", True),
+            result = bt.run(bt._type(
+                selector=params.get("selector"),
+                text=params.get("text", ""),
+                clear_first=params.get("clear_first", True),
             ))
 
         elif action == "scroll":
-            result = _bt.run(_bt._scroll(
-                direction=parameters.get("direction", "down"),
-                amount=parameters.get("amount", 500),
+            result = bt.run(bt._scroll(
+                direction=params.get("direction", "down"),
+                amount=params.get("amount", 500),
             ))
 
         elif action == "fill_form":
-            result = _bt.run(_bt._fill_form(parameters.get("fields", {})))
+            result = bt.run(bt._fill_form(params.get("fields", {})))
 
         elif action == "smart_click":
-            result = _bt.run(_bt._smart_click(parameters.get("description", "")))
+            result = bt.run(bt._smart_click(params.get("description", "")))
 
         elif action == "smart_type":
-            result = _bt.run(_bt._smart_type(
-                parameters.get("description", ""),
-                parameters.get("text", ""),
+            result = bt.run(bt._smart_type(
+                params.get("description", ""),
+                params.get("text", ""),
             ))
 
         elif action == "get_text":
-            result = _bt.run(_bt._get_text())
+            result = bt.run(bt._get_text())
 
         elif action == "press":
-            result = _bt.run(_bt._press(parameters.get("key", "Enter")))
+            result = bt.run(bt._press(params.get("key", "Enter")))
 
         elif action == "close":
-            result = _bt.run(_bt._close_browser())
+            result = bt.run(bt._close_browser())
 
         else:
             result = f"Unknown action: {action}"

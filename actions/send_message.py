@@ -4,11 +4,24 @@
 # hardcoded tab/click sequences — works on any screen resolution.
 
 import time
-import pyautogui
 from pathlib import Path
 
-pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.08
+# pyautogui is heavy (~1s cold import, ~13MB) and only needed when a
+# message is actually sent, so it's loaded lazily on first use instead of
+# at module import. PEP 562 __getattr__ keeps every `pyautogui.X` call
+# site working unchanged.
+_pyautogui = None
+
+def __getattr__(name: str):
+    global _pyautogui
+    if name == "pyautogui":
+        if _pyautogui is None:
+            import pyautogui
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = 0.08
+            _pyautogui = pyautogui
+        return _pyautogui
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def _open_app(app_name: str) -> bool:
     """Opens an app via Windows search."""

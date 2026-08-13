@@ -19,27 +19,16 @@ import re
 import time
 from pathlib import Path
 
+from actions.remote_runner import remote_execution_enabled, remote_run_command, run_script_file
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
-
-BASE_DIR           = get_base_dir()
-API_CONFIG_PATH    = BASE_DIR / "config" / "api_keys.json"
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
-GEMINI_MODEL       = "gemini-2.5-flash"
 
 
-def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
-
-
-def _get_gemini(model: str = GEMINI_MODEL):
+def _get_gemini(model: str = ""):
     from or_client import ClaudeModelShim
-    return ClaudeModelShim(model_name=model)
+    return ClaudeModelShim(model_name=model if model else None)
 
 
 def _clean_code(text: str) -> str:
@@ -215,6 +204,10 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
     interp = interpreters.get(path.suffix.lower())
     if not interp:
         return f"No interpreter for {path.suffix}."
+
+    if remote_execution_enabled():
+        cmd = f"{interp[0]} {path.name} {' '.join(args or [])}".strip()
+        return remote_run_command(cmd, path.parent, timeout=timeout)
 
     try:
         result = subprocess.run(

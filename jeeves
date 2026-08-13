@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Lightweight wrapper to run Jeeves CLI from shell
+# Usage: place this repo folder on your PATH, or symlink this file into /usr/local/bin
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$SCRIPT_DIR/cli.py" "$@"

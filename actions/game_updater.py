@@ -9,6 +9,15 @@ import winreg
 from pathlib import Path
 from datetime import datetime
 
+# External commands (tasklist/schtasks/shutdown/...) go through _run_cmd so
+# a wedged system service can never hang Jeeves indefinitely.
+_DEFAULT_CMD_TIMEOUT = 10
+
+
+def _run_cmd(*args, **kwargs):
+    kwargs.setdefault("timeout", _DEFAULT_CMD_TIMEOUT)
+    return subprocess.run(*args, **kwargs)
+
 
 def _find_steam_path() -> Path | None:
     registry_keys = [
@@ -103,7 +112,7 @@ def _get_steam_games(steam_path: Path) -> list[dict]:
 
 def _is_steam_running() -> bool:
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
+        out = _run_cmd(["tasklist", "/FI", "IMAGENAME eq steam.exe"],
                              capture_output=True, text=True).stdout
         return "steam.exe" in out.lower()
     except Exception:
@@ -621,7 +630,7 @@ def _watch_and_shutdown(steam_path: Path, speak=None, check_interval: int = 30, 
         if not any(g["state"] == 1026 for g in _get_steam_games(steam_path)):
             if speak: speak("Download complete. Shutting down now.")
             time.sleep(5)
-            subprocess.run(["shutdown", "/s", "/t", "10"])
+            _run_cmd(["shutdown", "/s", "/t", "10"])
             return
 
     if speak: speak("Download taking too long. Cancelling auto-shutdown.")
@@ -646,7 +655,7 @@ def _get_epic_games() -> list[dict]:
 
 def _is_epic_running() -> bool:
     try:
-        return "epicgameslauncher.exe" in subprocess.run(
+        return "epicgameslauncher.exe" in _run_cmd(
             ["tasklist", "/FI", "IMAGENAME eq EpicGamesLauncher.exe"],
             capture_output=True, text=True
         ).stdout.lower()
@@ -686,25 +695,25 @@ def _update_epic_games(epic_path: Path, game_name: str = None) -> str:
 def _schedule_daily_update(hour: int = 3, minute: int = 0) -> str:
     task_name   = "JARVIS_GameUpdater"
     script_path = Path(__file__).resolve()
-    subprocess.run(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True)
+    _run_cmd(["schtasks", "/Delete", "/TN", task_name, "/F"], capture_output=True)
     for extra in (["/RL", "HIGHEST", "/RU", "SYSTEM"], []):
         cmd    = ["schtasks", "/Create", "/TN", task_name,
                   "/TR", f'"{sys.executable}" "{script_path}" --scheduled',
                   "/SC", "DAILY", "/ST", f"{hour:02d}:{minute:02d}", "/F", *extra]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = _run_cmd(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             return f"Daily game update scheduled at {hour:02d}:{minute:02d}."
     return f"Scheduling failed: {result.stderr.strip()}"
 
 
 def _cancel_scheduled_update() -> str:
-    result = subprocess.run(["schtasks", "/Delete", "/TN", "JARVIS_GameUpdater", "/F"],
+    result = _run_cmd(["schtasks", "/Delete", "/TN", "JARVIS_GameUpdater", "/F"],
                             capture_output=True, text=True)
     return "Scheduled update cancelled." if result.returncode == 0 else "No scheduled update found."
 
 
 def _get_schedule_status() -> str:
-    result = subprocess.run(["schtasks", "/Query", "/TN", "JARVIS_GameUpdater", "/FO", "LIST"],
+    result = _run_cmd(["schtasks", "/Query", "/TN", "JARVIS_GameUpdater", "/FO", "LIST"],
                             capture_output=True, text=True)
     if result.returncode != 0:
         return "No scheduled game update found."
