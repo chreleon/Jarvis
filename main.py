@@ -17,6 +17,12 @@ from memory_cleanup import cleanup as cleanup_jeeves
 from config.tool_definitions import TOOL_DECLARATIONS
 from core.utils import get_provider_api_key, normalize_api_key
 
+# NOTE: action modules (file_processor, browser_control, composio_agent, ...)
+# are intentionally NOT imported at module level — they're loaded lazily via
+# _load_runtime_imports() so startup stays fast. composio_agent additionally
+# gets a defensive guard inside _execute_tool so a broken Composio SDK can
+# never crash the whole app.
+
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -39,7 +45,11 @@ MIN_UTTERANCE_MS       = 300
 VISION_COOLDOWN_S      = 12   # minimum gap between screen_process calls
 
 # Hard ceilings so a slow/hung call can never silence Jeeves for good.
-BRAIN_TIMEOUT_S        = 90   # LLM reasoning call (voice turn or tool follow-up)
+BRAIN_TIMEOUT_S        = 240  # LLM reasoning call (voice turn or tool follow-up)
+# 240s (not 90s) so the Groq key pool can exhaust ALL keys through its
+# recovery windows (RECOVERY_RETRIES x MAX_RECOVERY_WAIT_S ~= 210s) without
+# the app cutting the turn off mid-exhaustion. Still bounded — a genuinely
+# hung call surfaces "taking longer than usual" after 4 minutes.
 TOOL_TIMEOUT_S         = 120  # any tool run_in_executor call
 
 
@@ -97,7 +107,11 @@ def _load_runtime_imports() -> dict:
         from actions.web_search import web_search as web_search_action
         from actions.computer_control import computer_control
         from actions.game_updater import game_updater
-        from actions.system_monitor import system_status
+        from actions.system_monitor import system_status, SystemMonitor
+        from actions.background_monitor import (
+            add_monitor, remove_monitor, list_monitors,
+            check_all as monitor_check_all,
+        )
 
         from clap_listen import ClapListener
 
@@ -125,6 +139,11 @@ def _load_runtime_imports() -> dict:
             "computer_control": computer_control,
             "game_updater": game_updater,
             "system_status": system_status,
+            "SystemMonitor": SystemMonitor,
+            "add_monitor": add_monitor,
+            "remove_monitor": remove_monitor,
+            "list_monitors": list_monitors,
+            "monitor_check_all": monitor_check_all,
             # NOTE: run_agentic_task intentionally NOT bundled here — the
             # composio_agent module pulls in the full Composio SDK (~10s /
             # ~100MB cold). It's imported lazily inside _execute_tool only
@@ -185,6 +204,9 @@ class JeevesLive:
         self._clap_listener = None
         self._dashboard = None
         self._last_vision_ts = 0.0          # cooldown guard for screen_process
+        self._last_user_speech = 0.0        # recency guard for background alerts
+        self._sys_monitor = None            # lazy: SystemMonitor on first alert loop
+        self._alert_lock = None             # lazy: asyncio.Lock to serialize alerts
         self._briefing_done  = False        # morning briefing runs once per launch
         self.ui.on_text_command = self._on_text_command
         self.ui.on_clap_toggle  = self._on_clap_toggle
@@ -358,6 +380,18 @@ class JeevesLive:
                 r = await loop.run_in_executor(None, lambda: imports["system_status"](parameters=args, player=self.ui))
                 result = r or "Done."
 
+            elif name == "manage_monitor":
+                action = str(args.get("action", "")).lower().strip()
+                topic  = str(args.get("topic", "")).strip()
+                if action == "add":
+                    result = await asyncio.to_thread(imports["add_monitor"], topic)
+                elif action == "remove":
+                    result = await asyncio.to_thread(imports["remove_monitor"], topic)
+                else:
+                    topics = await asyncio.to_thread(imports["list_monitors"])
+                    result = ("Monitoring: " + ", ".join(topics)) if topics \
+                             else "No topics are being monitored."
+
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: imports["computer_settings"](parameters=args, response=None, player=self.ui))
                 result = r or "Done."
@@ -409,7 +443,17 @@ class JeevesLive:
             elif name == "composio_action":
                 # Lazy: composio_agent pulls the full Composio SDK (~10s /
                 # ~100MB cold) — only pay it when this tool is actually used.
-                from composio_agent import run_agentic_task
+                # Defensive: a broken/mismatched Composio SDK must never
+                # crash the whole app — degrade to a helpful message.
+                try:
+                    from composio_agent import run_agentic_task
+                except Exception as _composio_import_error:
+                    def run_agentic_task(request: str) -> str:
+                        return (
+                            f"Composio isn't available right now ({_composio_import_error}). "
+                            "Check that composio and composio-openai are installed and "
+                            "up to date, or run 'python doctor.py' for details."
+                        )
                 r = await loop.run_in_executor(
                     None, lambda: run_agentic_task(args.get("request", ""))
                 )
@@ -528,6 +572,7 @@ class JeevesLive:
                 self.ui.set_state("LISTENING")
 
     async def _handle_utterance(self, text: str):
+        self._last_user_speech = time.monotonic()
         self.ui.set_state("THINKING")
         self.conversation.append({"role": "user", "content": text})
 
@@ -745,6 +790,118 @@ class JeevesLive:
         except Exception as e:
             print(f"[JEEVES] Morning briefing skipped: {e}")
 
+    async def _speak_alert(self, alert: str):
+        """Voice a background alert, phrased naturally by the brain.
+
+        The [SYSTEM_ALERT]/[MONITOR_ALERT] strings are instructions for the
+        model ("warn the user in their language..."), not user-facing text,
+        so we run them through one short brain call. On any brain failure we
+        fall back to speaking the alert's first line directly — an alert must
+        never be swallowed silently.
+        """
+        if not self._loop or not self.audio_out_queue:
+            return
+        # Serialize alerts: both monitor loops can fire near-simultaneously,
+        # and two concurrent TTS emitters would interleave PCM chunks in the
+        # audio queue and garble playback.
+        if self._alert_lock is None:
+            self._alert_lock = asyncio.Lock()
+        async with self._alert_lock:
+            await self._do_speak_alert(alert)
+
+    @staticmethod
+    def _alert_has_tool_call(reply: str) -> bool:
+        """True if the brain replied with a {tool_call:...} JSON instead of prose."""
+        cleaned = (reply or "").strip()
+        if not cleaned.startswith("{"):
+            return False
+        try:
+            data = json.loads(cleaned)
+            return bool(data.get("tool_call"))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _alert_first_line(alert: str) -> str:
+        """First line of an alert with the [SYSTEM_ALERT]/[MONITOR_ALERT] tag stripped."""
+        line = (alert or "").splitlines()[0][:200] if alert else ""
+        for tag in ("[SYSTEM_ALERT]", "[MONITOR_ALERT]"):
+            if line.startswith(tag):
+                line = line[len(tag):].strip()
+                break
+        return line
+
+    async def _do_speak_alert(self, alert: str):
+        try:
+            system_prompt = self._build_system_prompt()
+            reply = await asyncio.wait_for(
+                asyncio.to_thread(
+                    _get_brain_client().multi_turn,
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": alert},
+                    ],
+                ),
+                timeout=BRAIN_TIMEOUT_S,
+            )
+            reply = (reply or "").strip()
+            # Never speak raw tool-call JSON — fall back to the alert text.
+            if not reply or self._alert_has_tool_call(reply):
+                reply = self._alert_first_line(alert) or \
+                        "Sir, I have an alert for you."
+            await self._speak_async(reply)
+            self.ui.write_log("SYS: Monitor alert spoken.")
+        except Exception as e:
+            print(f"[JEEVES] Alert: {e}")
+            try:
+                first = self._alert_first_line(alert)
+                if first:
+                    await self._speak_async(first)
+            except Exception:
+                pass
+
+    async def _run_system_monitor(self):
+        """Background task: voice alerts when hardware metrics cross thresholds."""
+        while True:
+            await asyncio.sleep(10)
+            try:
+                if self._sys_monitor is None:
+                    self._sys_monitor = _load_runtime_imports()["SystemMonitor"]()
+                alert = await asyncio.to_thread(self._sys_monitor.check)
+            except Exception as e:
+                print(f"[JEEVES] System monitor: {e}")
+                continue
+            if not alert:
+                continue
+            # Never interrupt an active conversation or a just-spoken turn
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or (time.monotonic() - self._last_user_speech) < 10:
+                continue
+            if getattr(self.ui, "muted", False):
+                continue
+            await self._speak_alert(alert)
+
+    async def _run_background_monitor(self):
+        """Check user-configured topics once per day; speak alerts on new headlines."""
+        await asyncio.sleep(300)          # wait 5 min after startup before first check
+        while True:
+            try:
+                with self._speaking_lock:
+                    speaking = self._is_speaking
+                recent_speech = (time.monotonic() - self._last_user_speech) < 30
+                if not speaking and not recent_speech \
+                        and not getattr(self.ui, "muted", False):
+                    alerts = await asyncio.to_thread(
+                        _load_runtime_imports()["monitor_check_all"]
+                    )
+                    for alert in alerts:
+                        await self._speak_alert(alert)
+                        await asyncio.sleep(6)   # gap between consecutive alerts
+            except Exception as e:
+                print(f"[JEEVES] Background monitor: {e}")
+            await asyncio.sleep(1800)     # re-check every 30 minutes
+
     async def run(self):
         self._maybe_start_clap_listener()
         try:
@@ -778,6 +935,8 @@ class JeevesLive:
                 async with asyncio.TaskGroup() as tg:
                     tg.create_task(self._listen_audio())
                     tg.create_task(self._play_audio())
+                    tg.create_task(self._run_system_monitor())
+                    tg.create_task(self._run_background_monitor())
 
             except Exception as e:
                 print(f"[JEEVES] Error: {e}")

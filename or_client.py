@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -78,7 +79,7 @@ def _normalize_provider(value: str | None) -> str:
 
 
 class _GroqKeyPool:
-    """Round-robin pool of Groq API keys with automatic rotation + quarantine.
+    """Round-robin pool of Groq API keys with rotation + two-tier quarantine.
 
     Reads the full key list from config/api_keys.json on every access, so
     keys added at any time (no restart needed, any number of keys) are
@@ -90,12 +91,28 @@ class _GroqKeyPool:
       * On rate-limit/quota (429-style) errors the current key is rotated
         out and the SAME request is retried with the next key, so Jeeves
         keeps working as long as any key still has quota.
-      * Keys that hit a rate limit are quarantined for a short cooldown
-        (RATE_LIMIT_COOLDOWN_S) so subsequent requests start from a healthy
-        key instead of re-hammering the one that just got exhausted.
+      * Keys that hit a per-minute limit are quarantined for a short
+        cooldown (RATE_LIMIT_COOLDOWN_S) — those recover in ~1 minute.
+      * Keys that hit their DAILY quota (detected from the error text) are
+        parked until the next calendar day — retrying them in 60s just
+        burns requests, so the pool skips them entirely (see current()).
     """
 
+    # Per-minute rate-limit window — recovers in ~1 minute.
     RATE_LIMIT_COOLDOWN_S = 60.0
+    # Floor for daily-capped keys (hours) in case next midnight is far away.
+    DAILY_CAP_COOLDOWN_S  = 8 * 3600.0
+    # Upper bound for a single recovery wait. The per-minute cooldown is
+    # 60s, so one wait always clears it; 90s leaves margin for slow clocks.
+    MAX_RECOVERY_WAIT_S   = 90.0
+    # Wait-and-retry cycles after a full lap fails: every configured key is
+    # re-tried after EACH recovery window, so a key that needs a longer
+    # cooldown is not abandoned early. 2 waits -> 3 full laps per request.
+    RECOVERY_RETRIES      = 2
+    # Hard ceiling on total time spent waiting for recovery across all
+    # cycles — guarantees a request can never be held hostage by a pool
+    # that keeps re-quarantining itself (e.g. one key past its daily cap).
+    TOTAL_EXHAUST_BUDGET_S = 210.0
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -114,8 +131,11 @@ class _GroqKeyPool:
     def current(self) -> str:
         """Next key in round-robin order, skipping any in cooldown.
 
-        Falls back to the current slot when every key is cooling down so
-        requests never stall waiting for one."""
+        When every key is cooling down, prefer the one that recovers
+        soonest — and never hand out a key parked long-term (daily cap),
+        so we don't waste requests on keys that won't recover for hours.
+        Falls back to the current slot when even the soonest recovery is
+        hours away (keeps the old no-stall guarantee)."""
         keys = self._keys()
         if not keys:
             raise RuntimeError("No Groq API keys configured in config/api_keys.json.")
@@ -126,7 +146,18 @@ class _GroqKeyPool:
                 if self._cooldown_until.get(keys[idx], 0.0) <= now:
                     self._idx = idx
                     return keys[idx]
-            # every key is cooling down — use the current slot anyway
+            # every key is cooling down — pick the one recovering soonest,
+            # unless all are parked long-term (daily caps)
+            best_at = float("inf")
+            best: str | None = None
+            for k in keys:
+                at = self._cooldown_until.get(k, 0.0)
+                if at < best_at:
+                    best_at, best = at, k
+            if best is not None and best_at - now <= self.MAX_RECOVERY_WAIT_S:
+                self._idx = keys.index(best)
+                return best
+            # all parked hours away — use the current slot anyway
             self._idx = self._idx % len(keys)
             return keys[self._idx]
 
@@ -139,6 +170,36 @@ class _GroqKeyPool:
     def mark_rate_limited(self, key: str) -> None:
         with self._lock:
             self._cooldown_until[key] = time.time() + self.RATE_LIMIT_COOLDOWN_S
+
+    def mark_daily_capped(self, key: str) -> None:
+        """Park a key until the next calendar day (daily-quota exhaustion).
+
+        Daily limits do NOT recover in the 60s per-minute window, so the
+        key is quarantined until next local midnight + a 5 min buffer,
+        bounded to at most 24h and at least DAILY_CAP_COOLDOWN_S. Local
+        midnight is the pragmatic reset assumption (Groq's exact daily
+        window is account-dependent); the 8h floor guards clock skew.
+        """
+        now = datetime.now()
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        until = next_midnight.timestamp() + 300
+        with self._lock:
+            self._cooldown_until[key] = min(
+                until, time.time() + self.DAILY_CAP_COOLDOWN_S
+            )
+
+    def earliest_recovery(self) -> float | None:
+        """Timestamp when the first quarantined key recovers; None if none cooling."""
+        now = time.time()
+        keys = self._keys()
+        with self._lock:
+            cooling = [
+                self._cooldown_until[k] for k in keys
+                if self._cooldown_until.get(k, 0.0) > now
+            ]
+        return min(cooling) if cooling else None
 
 
 _groq_pool = _GroqKeyPool()
@@ -157,16 +218,31 @@ class ClaudeClient:
     """
 
     def __init__(self) -> None:
-        self._config = _load_config()
-        self.provider = _normalize_provider(self._config.get("brain_provider"))
-        self.api_key = self._resolve_api_key(self.provider)
-        self._preferred_text_model = self._default_model_for_provider(self.provider)
+        # Lazy init: do NOT read config/api_keys.json or resolve any key
+        # here. main.py imports this module before the setup screen has a
+        # chance to create the config file — constructing eagerly would
+        # crash the whole app on first launch. Everything below is resolved
+        # on first use (see _ensure_loaded / _resolve_api_key).
+        self._config = None
+        self.provider = DEFAULT_PROVIDER
+        self.api_key = None
+        self._preferred_text_model = None
         self._provider_change_callbacks: list = []
+
+    def _ensure_loaded(self) -> None:
+        """Load config + resolve provider/key on first use (not at import)."""
+        if self._config is None:
+            self._config = _load_config()
+            self.provider = _normalize_provider(self._config.get("brain_provider"))
+            self.api_key = self._resolve_api_key(self.provider)
+            if self._preferred_text_model is None:
+                self._preferred_text_model = self._default_model_for_provider(self.provider)
 
     def _default_model_for_provider(self, provider: str) -> str:
         return GITHUB_DEFAULT_MODEL if provider == "github_models" else GROQ_DEFAULT_MODEL
 
     def _resolve_api_key(self, provider: str) -> str:
+        self._ensure_loaded()
         if provider == "github_models":
             key = str(self._config.get("github_models_api_key", "")).strip()
             if not key:
@@ -193,15 +269,63 @@ class ClaudeClient:
         return Groq(api_key=_groq_pool.current())
 
     def _groq_create(self, model, max_tokens, temperature, messages) -> str:
-        """Call Groq with automatic key rotation.
+        """Call Groq with automatic key rotation + wait-for-recovery retry.
 
-        Uses the pool's current round-robin key; on rate-limit/quota errors
-        it quarantines that key, rotates to the next configured key and
-        retries the same request, so one exhausted free-tier key never
-        stops the assistant while others still have quota. Advances the
-        pool after success to spread usage across all keys.
+        Lap 1: round-robin across all configured keys. On 429-style errors
+        the key is quarantined (60s for per-minute limits, until tomorrow
+        for daily-cap exhaustion) and the same request is retried with the
+        next key. If the whole pool is exhausted, wait until the soonest
+        key recovers and retry the same request — repeating through every
+        recovery window (RECOVERY_RETRIES) until ALL keys are genuinely
+        exhausted, then surface the error so the provider fallback
+        (github_models) can take over. Bounded by MAX_RECOVERY_WAIT_S per
+        wait and TOTAL_EXHAUST_BUDGET_S overall, so a request can never be
+        held hostage by a pool that never recovers.
         """
         attempts = max(1, _groq_pool.size())
+        last_error: Exception | None = None
+        started = time.monotonic()
+        for cycle in range(1 + _groq_pool.RECOVERY_RETRIES):
+            try:
+                return self._groq_lap(model, max_tokens, temperature, messages, attempts)
+            except RuntimeError as e:
+                last_error = e
+                if cycle >= _groq_pool.RECOVERY_RETRIES:
+                    break
+                recovery_at = _groq_pool.earliest_recovery()
+                if recovery_at is None:
+                    break
+                wait_s = recovery_at - time.time()
+                if wait_s <= 0:
+                    wait_s = 1.0
+                if wait_s > _groq_pool.MAX_RECOVERY_WAIT_S:
+                    # keys parked long-term (daily caps) — don't hang the
+                    # request; surface the error so the provider fallback
+                    # (github_models) can take over instead.
+                    break
+                if time.monotonic() - started + wait_s > _groq_pool.TOTAL_EXHAUST_BUDGET_S:
+                    # every key has been re-tried through every recoverable
+                    # window and the pool is still hot — genuinely exhausted.
+                    break
+                logger.warning(
+                    f"[groq] all {attempts} key(s) rate-limited; waiting "
+                    f"{wait_s:.0f}s for recovery before retrying "
+                    f"(cycle {cycle + 1}/{_groq_pool.RECOVERY_RETRIES}, "
+                    f"budget {_groq_pool.TOTAL_EXHAUST_BUDGET_S:.0f}s)"
+                )
+                time.sleep(wait_s + 0.5)
+        raise RuntimeError(
+            f"Groq API call failed after {attempts} key(s): {last_error}"
+        ) from last_error
+
+    def _groq_lap(self, model, max_tokens, temperature, messages, attempts: int) -> str:
+        """One round-robin pass over all keys. Returns text or raises.
+
+        Capacity errors quarantine the key (60s or daily-park depending on
+        the error text) and move to the next key. Non-capacity errors
+        (auth, 5xx, network) raise immediately — never retried, never
+        waited on.
+        """
         last_error: Exception | None = None
         for _ in range(attempts):
             key = _groq_pool.current()
@@ -216,18 +340,50 @@ class ClaudeClient:
                 return (response.choices[0].message.content or "").strip()
             except Exception as e:
                 last_error = e
-                if self._is_capacity_error(e) and attempts > 1:
+                if not self._is_capacity_error(e):
+                    raise
+                if self._is_daily_cap_error(e):
+                    _groq_pool.mark_daily_capped(key)
+                    logger.warning(
+                        f"[groq] {model} hit its DAILY quota on a key; "
+                        f"parked until tomorrow (pool of {attempts})"
+                    )
+                else:
                     _groq_pool.mark_rate_limited(key)
-                    _groq_pool.advance()
                     logger.warning(
                         f"[groq] {model} hit a rate limit on one key; "
                         f"rotating to the next Groq key (pool of {attempts})"
                     )
-                    continue
-                raise
+                _groq_pool.advance()
+                continue
         raise RuntimeError(
             f"Groq API call failed after {attempts} key(s): {last_error}"
         ) from last_error
+
+    @staticmethod
+    def _is_daily_cap_error(error: Exception) -> bool:
+        """Detect daily-quota exhaustion (won't recover in ~60s) from error text.
+
+        Groq embeds the limit window in its 429 message. Daily-window
+        markers get a long quarantine; everything else gets the 60s
+        per-minute cooldown. Heuristic by design — a false negative just
+        means one extra 60s retry, never a hang.
+        """
+        message = str(error).lower()
+        return any(
+            token in message
+            for token in (
+                "per day",
+                "requests per day",
+                "rpd",
+                "daily limit",
+                "daily quota",
+                "daily rate limit",
+                "per 24",
+                "24 hour",
+                "24-hour",
+            )
+        )
 
     def _github_models_request(self, payload: dict) -> dict:
         response = requests.post(
@@ -300,6 +456,7 @@ class ClaudeClient:
         return candidates
 
     def _call(self, model, system, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+        self._ensure_loaded()
         full_messages = [{"role": "system", "content": system}] + messages
         last_error: Exception | None = None
         # First try the configured provider. If it fails due to capacity or
@@ -386,10 +543,12 @@ class ClaudeClient:
         raise RuntimeError(f"Both providers failed: {final_err}") from final_err
 
     def chat(self, prompt, system=DEFAULT_SYSTEM, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+        self._ensure_loaded()
         messages = [{"role": "user", "content": prompt}]
         return self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature)
 
     def chat_json(self, prompt, system="Return ONLY valid JSON. No markdown fences, no extra text, no explanation.", model=None, max_tokens=DEFAULT_MAX_TOKENS) -> dict:
+        self._ensure_loaded()
         messages = [{"role": "user", "content": prompt}]
         raw = self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature=0.2)
         clean = raw.strip()
@@ -406,6 +565,7 @@ class ClaudeClient:
             raise ValueError(f"Model returned unparseable JSON: {e}\nRaw output: {raw[:200]}")
 
     def vision(self, prompt, image_b64, mime="image/png", system="Analyze the image and describe what you see clearly and concisely.", model=None, max_tokens=1024) -> str:
+        self._ensure_loaded()
         vision_model = "gpt-4.1" if self.provider == "github_models" else "llama-3.2-90b-vision-preview"
         messages = [{"role": "user", "content": [
             {"type": "text", "text": prompt},
@@ -478,6 +638,7 @@ class ClaudeClient:
             raise RuntimeError(f"Both providers failed for vision: {e2}") from e2
 
     def vision_from_file(self, prompt, image_path, system="Analyze the image and describe what you see clearly and concisely.", model=None, max_tokens=1024) -> str:
+        self._ensure_loaded()
         path = Path(image_path)
         mime_map = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
         mime = mime_map.get(path.suffix.lower(), "image/png")
@@ -494,6 +655,7 @@ class ClaudeClient:
         self._provider_change_callbacks.append(callback)
 
     def multi_turn(self, messages, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+        self._ensure_loaded()
         system = DEFAULT_SYSTEM
         chat_messages = []
         for m in messages:
@@ -504,6 +666,7 @@ class ClaudeClient:
         return self._call(model or self._default_model_for_provider(self.provider), system, chat_messages, max_tokens, temperature)
 
     def available_models(self) -> dict:
+        self._ensure_loaded()
         if self.provider == "github_models":
             return {
                 "provider": "github_models",
@@ -533,6 +696,7 @@ class ClaudeModelShim:
         self.system_instruction = system_instruction
 
     def _resolve_model(self) -> str:
+        client._ensure_loaded()
         if self.model_name:
             lower = self.model_name.lower()
             if "mini" in lower or "lite" in lower:
