@@ -68,7 +68,7 @@ py main.py
     "port": 22,
     "identity_file": "C:/Users/you/.ssh/id_ed25519",
     "remote_root": "/tmp/jeeves"
-  (`en_GB-alan-medium`) into `voices/` for you, no manual download needed
+  (`en_GB-jenny_dioco-medium`) into `voices/` for you, no manual download needed
 - **Connect accounts (optional)** -- GitHub / Gmail / Calendar buttons open the
   Composio authorization page in your browser directly from the setup screen
 
@@ -150,7 +150,7 @@ cd Jeeves
 pip install flask groq faster-whisper piper-tts composio-core composio-openai
 ```
 
-Voice files: download `en_GB-alan-medium.onnx` and `.onnx.json` from
+Voice files: download `en_GB-jenny_dioco-medium.onnx` and `.onnx.json` from
 https://github.com/rhasspy/piper/releases into a `voices/` folder (no
 auto-download button in this mode). Choose Groq or GitHub Models in the setup
 screen, then add the matching credential to `config/api_keys.json`:
@@ -325,7 +325,7 @@ yourself:
   "os_system": "windows"
 }
 ```
-and download `en_GB-alan-medium.onnx` + `en_GB-alan-medium.onnx.json` from
+and download `en_GB-jenny_dioco-medium.onnx` + `en_GB-jenny_dioco-medium.onnx.json` from
 https://github.com/rhasspy/piper/releases into a `voices/` folder in the
 project root.
 
