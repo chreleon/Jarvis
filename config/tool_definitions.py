@@ -469,6 +469,42 @@ TOOL_DECLARATIONS = [
     },
 ]
 
+# ── Compact LLM rendering ──────────────────────────────────────────────────
+# The full TOOL_DECLARATIONS JSON above is ~24KB (~6k tokens) per request.
+# Most of that is per-parameter prose the model rarely needs. This compact
+# rendering keeps the tool name, one-line description, and each parameter's
+# name/type/required flag — cutting the tools section to roughly a quarter
+# of the size so requests stay inside free-tier token budgets (the 413
+# "Payload Too Large" failures in the logs came from shipping the full
+# schema on every call).
+
+_COMPACT_CACHE: str | None = None
+
+
+def compact_tool_declarations() -> str:
+    """Compact, token-cheap rendering of TOOL_DECLARATIONS for system prompts."""
+    global _COMPACT_CACHE
+    if _COMPACT_CACHE is not None:
+        return _COMPACT_CACHE
+    lines = []
+    for t in TOOL_DECLARATIONS:
+        name = str(t.get("name", "?"))
+        desc = (t.get("description") or "").strip().splitlines()[0].strip()
+        params = t.get("parameters") or {}
+        props = params.get("properties") or {}
+        required = set(params.get("required") or [])
+        if props:
+            sig = ", ".join(
+                f"{k}:{(v.get('type') or 'string').lower()}{'' if k in required else '?'}"
+                for k, v in props.items()
+            )
+        else:
+            sig = ""
+        lines.append(f"- {name}({sig}): {desc}")
+    _COMPACT_CACHE = "\n".join(lines)
+    return _COMPACT_CACHE
+
+
 # ── Lightweight display registry ──────────────────────────────────────────
 # Used by the CLI /tools listing for human-readable output.
 

@@ -1,7 +1,7 @@
 import json
 import re
 from datetime import datetime
-from threading import Lock
+from threading import RLock
 from pathlib import Path
 import sys
 
@@ -14,7 +14,12 @@ def get_base_dir() -> Path:
 
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = BASE_DIR / "memory" / "long_term.json"
-_lock            = Lock()
+# RLock (not Lock): load_memory() acquires it internally, and callers like
+# actions/background_monitor._save() need to hold it across a full
+# read-modify-write cycle that includes load_memory() — a non-reentrant Lock
+# would deadlock the same thread on that second acquire. RLock is strictly
+# more permissive, so existing single-acquire call sites are unaffected.
+_lock            = RLock()
 MAX_VALUE_LENGTH = 380
 MEMORY_MAX_CHARS = 2200
 

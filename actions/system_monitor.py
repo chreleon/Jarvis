@@ -43,7 +43,8 @@ def _nvml_gpu() -> float:
             for name in candidates:
                 try:
                     lib = _load(name)
-                    lib.nvmlInit_v2()
+                    if lib.nvmlInit_v2() != 0:
+                        continue  # driver present but init failed — try next candidate
                     _nvml_lib = lib
                     break
                 except Exception:
@@ -54,9 +55,15 @@ def _nvml_gpu() -> float:
             return -1.0
 
         dev = ctypes.c_void_p()
-        _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev))
+        if _nvml_lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev)) != 0:
+            _nvml_ok = False
+            return -1.0
+
         u = _Util()
-        _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u))
+        if _nvml_lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(u)) != 0:
+            _nvml_ok = False
+            return -1.0
+
         _nvml_ok = True
         return float(u.gpu)
     except Exception:
@@ -199,6 +206,11 @@ class SystemMonitor:
         self.thresholds   = {**DEFAULT_THRESHOLDS, **(thresholds or {})}
         self._last_alert: dict[str, float] = {}
         self._cpu_streak  = 0
+        # Last fired alert (for the remote dashboard / UI display). Set
+        # whenever check() returns a non-empty alert; read from other
+        # threads — simple string attr, atomic under the GIL.
+        self.last_alert: str | None = None
+        self.last_alert_at: float | None = None
 
     def _can_alert(self, key: str) -> bool:
         return (time.monotonic() - self._last_alert.get(key, 0)) > _ALERT_COOLDOWN
@@ -252,4 +264,8 @@ class SystemMonitor:
             )
             self._record("gpu")
 
-        return " ".join(alerts) if alerts else None
+        alert_text = " ".join(alerts) if alerts else None
+        if alert_text:
+            self.last_alert    = alert_text
+            self.last_alert_at = time.time()
+        return alert_text

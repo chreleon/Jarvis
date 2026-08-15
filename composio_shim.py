@@ -44,6 +44,7 @@ class App:
     GITHUB = "GITHUB"
     GMAIL = "GMAIL"
     GOOGLECALENDAR = "GOOGLECALENDAR"
+    TRIGGERCMD = "TRIGGERCMD"
 
 
 def _is_expired_account_error(exc: Exception) -> bool:
@@ -132,7 +133,7 @@ class ComposioToolSet:
         toolkits = []
         for app in apps or []:
             slug = _app_to_slug(app)
-            if slug in {"github", "gmail", "googlecalendar"}:
+            if slug in {"github", "gmail", "googlecalendar", "triggercmd"}:
                 toolkits.append(slug)
 
         try:

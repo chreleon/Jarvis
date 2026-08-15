@@ -223,6 +223,7 @@ class ClaudeClient:
         # chance to create the config file — constructing eagerly would
         # crash the whole app on first launch. Everything below is resolved
         # on first use (see _ensure_loaded / _resolve_api_key).
+        self._init_lock = threading.Lock()
         self._config = None
         self.provider = DEFAULT_PROVIDER
         self.api_key = None
@@ -230,13 +231,23 @@ class ClaudeClient:
         self._provider_change_callbacks: list = []
 
     def _ensure_loaded(self) -> None:
-        """Load config + resolve provider/key on first use (not at import)."""
-        if self._config is None:
-            self._config = _load_config()
-            self.provider = _normalize_provider(self._config.get("brain_provider"))
-            self.api_key = self._resolve_api_key(self.provider)
-            if self._preferred_text_model is None:
-                self._preferred_text_model = self._default_model_for_provider(self.provider)
+        """Load config + resolve provider/key on first use (not at import).
+
+        Double-checked locking: the cheap unlocked check keeps the hot path
+        (every call after the first) lock-free; the lock only guards the
+        one-time load so concurrent callers (background monitors + a live
+        user turn can all hit this in the same second) don't redo the work
+        or race each other.
+        """
+        if self._config is not None:
+            return
+        with self._init_lock:
+            if self._config is None:
+                self._config = _load_config()
+                self.provider = _normalize_provider(self._config.get("brain_provider"))
+                self.api_key = self._resolve_api_key(self.provider)
+                if self._preferred_text_model is None:
+                    self._preferred_text_model = self._default_model_for_provider(self.provider)
 
     def _default_model_for_provider(self, provider: str) -> str:
         return GITHUB_DEFAULT_MODEL if provider == "github_models" else GROQ_DEFAULT_MODEL
@@ -268,7 +279,7 @@ class ClaudeClient:
 
         return Groq(api_key=_groq_pool.current())
 
-    def _groq_create(self, model, max_tokens, temperature, messages) -> str:
+    def _groq_create(self, model, max_tokens, temperature, messages, wait_for_recovery: bool = True) -> str:
         """Call Groq with automatic key rotation + wait-for-recovery retry.
 
         Lap 1: round-robin across all configured keys. On 429-style errors
@@ -281,8 +292,16 @@ class ClaudeClient:
         (github_models) can take over. Bounded by MAX_RECOVERY_WAIT_S per
         wait and TOTAL_EXHAUST_BUDGET_S overall, so a request can never be
         held hostage by a pool that never recovers.
+
+        wait_for_recovery=False runs a single lap with NO recovery sleeps —
+        for callers (alerts, background tasks) that must fail fast and fall
+        back to their own path instead of stalling behind a quarantined
+        pool (which is what turned every alert into a 30s timeout when the
+        free-tier quota was exhausted).
         """
         attempts = max(1, _groq_pool.size())
+        if not wait_for_recovery:
+            return self._groq_lap(model, max_tokens, temperature, messages, attempts)
         last_error: Exception | None = None
         started = time.monotonic()
         for cycle in range(1 + _groq_pool.RECOVERY_RETRIES):
@@ -325,8 +344,16 @@ class ClaudeClient:
         the error text) and move to the next key. Non-capacity errors
         (auth, 5xx, network) raise immediately — never retried, never
         waited on.
+
+        Payload errors (413 / "request too large") get the payload trimmed
+        and retried ONCE on the same key; if still too large they raise
+        immediately. Waiting out a 60s cooldown or rotating keys can never
+        shrink a request — before this fix, every oversized request burned
+        the full recovery budget (2 waits x 3 keys) on a failure that could
+        never succeed.
         """
         last_error: Exception | None = None
+        shrunk_once = False
         for _ in range(attempts):
             key = _groq_pool.current()
             try:
@@ -340,6 +367,21 @@ class ClaudeClient:
                 return (response.choices[0].message.content or "").strip()
             except Exception as e:
                 last_error = e
+                if self._is_payload_error(e):
+                    # The request itself is too big — quarantining keys or
+                    # waiting can't fix that. Trim once and retry; if it's
+                    # still too large, surface immediately so the caller
+                    # fails over fast instead of burning the 60s recovery
+                    # dance on a request that can never succeed.
+                    if not shrunk_once:
+                        shrunk_once = True
+                        messages = self._shrink_messages(messages)
+                        logger.warning(
+                            f"[groq] {model} request too large — trimming "
+                            "messages and retrying once"
+                        )
+                        continue
+                    raise
                 if not self._is_capacity_error(e):
                     raise
                 if self._is_daily_cap_error(e):
@@ -401,6 +443,48 @@ class ClaudeClient:
         return response.json()
 
     @staticmethod
+    def _is_payload_error(error: Exception) -> bool:
+        """Detect 'request too large' rejections (413 / context overflow).
+
+        These never recover by waiting or rotating keys — the request
+        itself is too big — so they must NOT go through the quarantine /
+        recovery cycle (that was the endless 60s-wait 413 loop in the
+        logs). Checked BEFORE _is_capacity_error because Groq's 413 body
+        also contains the word 'tokens'.
+        """
+        message = str(error).lower()
+        return any(
+            token in message
+            for token in (
+                "413",
+                "request too large",
+                "payload too large",
+                "reduce your message size",
+                "too large for model",
+                "maximum context",
+                "context length",
+                "context window",
+                "context_length_exceeded",
+                "token limit exceeded",
+            )
+        )
+
+    @staticmethod
+    def _shrink_messages(messages: list, limit: int = 3000) -> list:
+        """Truncate oversized message content in place of a retry.
+
+        The cap includes the trim marker, so the result is at most `limit`
+        chars."""
+        suffix = "\n…[trimmed]"
+        out = []
+        for m in messages:
+            content = m.get("content")
+            if isinstance(content, str) and len(content) > limit:
+                content = content[:limit - len(suffix)].rstrip() + suffix
+            out.append({**m, "content": content})
+        return out
+
+    @staticmethod
     def _is_capacity_error(error: Exception) -> bool:
         message = str(error).lower()
         return any(
@@ -455,7 +539,7 @@ class ClaudeClient:
 
         return candidates
 
-    def _call(self, model, system, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+    def _call(self, model, system, messages, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE, wait_for_recovery: bool = True) -> str:
         self._ensure_loaded()
         full_messages = [{"role": "system", "content": system}] + messages
         last_error: Exception | None = None
@@ -485,7 +569,7 @@ class ClaudeClient:
 
                     # groq path — auto-rotates across all configured keys
                     # on rate limits, so one exhausted free key never stalls
-                    text = self._groq_create(candidate_model, max_tokens, temperature, full_messages)
+                    text = self._groq_create(candidate_model, max_tokens, temperature, full_messages, wait_for_recovery)
                     self._preferred_text_model = candidate_model
                     return True, None, text
 
@@ -542,15 +626,15 @@ class ClaudeClient:
         final_err = err2 or err
         raise RuntimeError(f"Both providers failed: {final_err}") from final_err
 
-    def chat(self, prompt, system=DEFAULT_SYSTEM, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+    def chat(self, prompt, system=DEFAULT_SYSTEM, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE, wait_for_recovery: bool = True) -> str:
         self._ensure_loaded()
         messages = [{"role": "user", "content": prompt}]
-        return self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature)
+        return self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature, wait_for_recovery)
 
-    def chat_json(self, prompt, system="Return ONLY valid JSON. No markdown fences, no extra text, no explanation.", model=None, max_tokens=DEFAULT_MAX_TOKENS) -> dict:
+    def chat_json(self, prompt, system="Return ONLY valid JSON. No markdown fences, no extra text, no explanation.", model=None, max_tokens=DEFAULT_MAX_TOKENS, wait_for_recovery: bool = True) -> dict:
         self._ensure_loaded()
         messages = [{"role": "user", "content": prompt}]
-        raw = self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature=0.2)
+        raw = self._call(model or self._default_model_for_provider(self.provider), system, messages, max_tokens, temperature=0.2, wait_for_recovery=wait_for_recovery)
         clean = raw.strip()
         if clean.startswith("```"):
             parts = clean.split("```")
@@ -654,7 +738,7 @@ class ClaudeClient:
             raise TypeError("callback must be callable")
         self._provider_change_callbacks.append(callback)
 
-    def multi_turn(self, messages, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE) -> str:
+    def multi_turn(self, messages, model=None, max_tokens=DEFAULT_MAX_TOKENS, temperature=DEFAULT_TEMPERATURE, wait_for_recovery: bool = True) -> str:
         self._ensure_loaded()
         system = DEFAULT_SYSTEM
         chat_messages = []
@@ -663,7 +747,7 @@ class ClaudeClient:
                 system = m.get("content", system)
             else:
                 chat_messages.append(m)
-        return self._call(model or self._default_model_for_provider(self.provider), system, chat_messages, max_tokens, temperature)
+        return self._call(model or self._default_model_for_provider(self.provider), system, chat_messages, max_tokens, temperature, wait_for_recovery)
 
     def available_models(self) -> dict:
         self._ensure_loaded()

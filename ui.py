@@ -24,9 +24,9 @@ from PyQt6.QtGui import (
     QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QPushButton, QScrollArea, QSizePolicy, QTextEdit,
-    QVBoxLayout, QWidget, QProgressBar,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QPushButton, QProgressBar, QScrollArea,
+    QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH as API_FILE
@@ -1553,6 +1553,466 @@ class RemoteKeyOverlay(QWidget):
         self.hide()
 
 
+class VoiceTriggersOverlay(QWidget):
+    """Floating overlay - connect Google Assistant via TRIGGERcmd and manage
+    JARVIS-style voice triggers without touching any code.
+
+    Self-contained: reads/writes config/api_keys.json through voice_triggers.py
+    and generates the TRIGGERcmd agent's commands.json. Also installs the
+    TRIGGERcmd MCP server so Jeeves' brain can run commands directly (no IFTTT).
+    Long outputs (setup steps, MCP status, test results) are shown in the main
+    window's ContentPanel via the show_doc signal; the small status label keeps
+    the last short message.
+    """
+
+    _OW, _OH = 640, 780
+    show_doc = pyqtSignal(str, str)   # (title, body) -> main window content panel
+    test_result = pyqtSignal(str)     # thread -> UI thread test output
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            VoiceTriggersOverlay {{
+                background: rgba(0, 4, 12, 0.96);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 14px;
+            }}
+        """)
+        import voice_triggers as vt
+        self._vt = vt
+        self.test_result.connect(self._set_out)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 14, 22, 14)
+        lay.setSpacing(6)
+
+        def _lbl(txt, fs=9, bold=False, color=C.PRI,
+                 align=Qt.AlignmentFlag.AlignCenter):
+            w = QLabel(txt)
+            w.setAlignment(align)
+            w.setFont(QFont("Courier New", fs,
+                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
+            w.setStyleSheet(f"color: {color}; background: transparent;")
+            w.setWordWrap(True)
+            return w
+
+        def _btn(txt, color=C.PRI, bg=C.PANEL):
+            b = QPushButton(txt)
+            b.setFixedHeight(30)
+            b.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"""
+                QPushButton {{
+                    background: {bg}; color: {color};
+                    border: 1px solid {C.PRI_DIM}; border-radius: 5px;
+                }}
+                QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+            """)
+            return b
+
+        def _field(placeholder):
+            e = QLineEdit()
+            e.setPlaceholderText(placeholder)
+            e.setFont(QFont("Courier New", 8))
+            e.setStyleSheet(
+                f"QLineEdit {{ background: #061017; color: {C.TEXT}; "
+                f"border: 1px solid {C.BORDER}; border-radius: 4px; padding: 5px; }}"
+            )
+            return e
+
+        lay.addWidget(_lbl("◈  VOICE TRIGGERS", 12, True))
+        lay.addWidget(_lbl("Control Jeeves from Google Assistant (TRIGGERcmd)", 8,
+                           color=C.TEXT_DIM))
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 1px 0;")
+        lay.addWidget(sep)
+
+        # ── Connection ───────────────────────────────────────────────────────
+        conn = QWidget()
+        conn.setStyleSheet(
+            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 6px;"
+        )
+        cl = QVBoxLayout(conn); cl.setContentsMargins(10, 8, 10, 8); cl.setSpacing(4)
+        cl.addWidget(_lbl("CONNECTION  (from triggercmd.com)", 7, True, C.ACC2,
+                          Qt.AlignmentFlag.AlignLeft))
+        self._token_ed = _field("TriggerCmd token  (account -> Instructions)")
+        self._token_ed.setEchoMode(QLineEdit.EchoMode.Password)
+        self._computer_ed = _field("Computer name as shown in TriggerCmd")
+        self._agent_dir_ed = _field("Agent data dir  (where commands.json lives)")
+        cl.addWidget(self._token_ed)
+        cl.addWidget(self._computer_ed)
+        cl.addWidget(self._agent_dir_ed)
+        save_btn = _btn("SAVE CONNECTION")
+        save_btn.clicked.connect(self._save_connection)
+        cl.addWidget(save_btn)
+        comp_btn = _btn("🔗  LINK FROM COMPOSIO", C.ACC2, C.PANEL2)
+        comp_btn.setToolTip("Use the TRIGGERcmd account already connected in your "
+                            "Composio workspace - fills in the computer name for you.")
+        comp_btn.clicked.connect(self._link_from_composio)
+        cl.addWidget(comp_btn)
+        lay.addWidget(conn)
+
+        # ── AI control (TRIGGERcmd MCP - free, no IFTTT) ─────────────────────
+        mcp_panel = QWidget()
+        mcp_panel.setStyleSheet(
+            f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 6px;"
+        )
+        ml = QVBoxLayout(mcp_panel); ml.setContentsMargins(10, 8, 10, 8); ml.setSpacing(4)
+        ml.addWidget(_lbl("AI CONTROL  -  TRIGGERCMD MCP  (free, no IFTTT)", 7, True,
+                          C.GREEN, Qt.AlignmentFlag.AlignLeft))
+        self._mcp_status_lbl = _lbl("checking...", 7, color=C.TEXT_MED,
+                                    align=Qt.AlignmentFlag.AlignLeft)
+        self._mcp_status_lbl.setWordWrap(True)
+        ml.addWidget(self._mcp_status_lbl)
+        mcp_row = QHBoxLayout(); mcp_row.setSpacing(6)
+        install_mcp_btn = _btn("⬇  INSTALL MCP SERVER", C.GREEN)
+        install_mcp_btn.setToolTip(
+            "Downloads the official TRIGGERcmd stdio MCP binary into bin/ and adds it "
+            "to config mcp_servers - Jeeves' brain can then run any TRIGGERcmd command "
+            "directly (no IFTTT, no subscription)."
+        )
+        install_mcp_btn.clicked.connect(self._install_mcp)
+        mcp_status_btn = _btn("MCP STATUS", C.ACC2, C.PANEL2)
+        mcp_status_btn.clicked.connect(self._mcp_status)
+        mcp_row.addWidget(install_mcp_btn)
+        mcp_row.addWidget(mcp_status_btn)
+        ml.addLayout(mcp_row)
+        lay.addWidget(mcp_panel)
+
+        # ── Trigger rows ─────────────────────────────────────────────────────
+        lay.addWidget(_lbl("TRIGGERS  -  say these after 'OK Google'", 7, True,
+                           C.ACC2, Qt.AlignmentFlag.AlignLeft))
+        self._rows_box = QWidget()
+        self._rows_lay = QVBoxLayout(self._rows_box)
+        self._rows_lay.setContentsMargins(0, 0, 0, 0)
+        self._rows_lay.setSpacing(4)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        scroll.setWidget(self._rows_box)
+        scroll.setFixedHeight(250)
+        lay.addWidget(scroll)
+
+        add_btn = _btn("＋  ADD TRIGGER", C.GREEN)
+        add_btn.clicked.connect(self._add_trigger)
+        lay.addWidget(add_btn)
+
+        # ── Actions ──────────────────────────────────────────────────────────
+        self._ground_lbl = _lbl("ground: detecting...", 7, color=C.TEXT_MED,
+                                align=Qt.AlignmentFlag.AlignLeft)
+        self._ground_lbl.setToolTip(
+            "TRIGGERcmd only uploads commands whose 'ground' matches the agent's "
+            "run mode (foreground = desktop app, background = daemon/service). "
+            "GENERATE auto-detects it from ~/.TRIGGERcmdData/debug.log; force a "
+            "mode with: python voice_triggers.py --generate "
+            "--ground foreground|background"
+        )
+        lay.addWidget(self._ground_lbl)
+        act = QHBoxLayout(); act.setSpacing(6)
+        gen_btn = _btn("GENERATE commands.json")
+        ins_btn = _btn("SETUP STEPS (FREE)")
+        test_btn = _btn("TEST FIRST", C.GREEN)
+        close_btn = _btn("DISMISS", C.TEXT_MED, C.PANEL2)
+        gen_btn.clicked.connect(self._generate)
+        ins_btn.clicked.connect(self._instructions)
+        test_btn.clicked.connect(self._test)
+        close_btn.clicked.connect(self.hide)
+        for b in (gen_btn, ins_btn, test_btn, close_btn):
+            act.addWidget(b)
+        lay.addLayout(act)
+
+        self._out = QLabel("Ready.")
+        self._out.setFont(QFont("Courier New", 7))
+        self._out.setStyleSheet(
+            f"color: {C.TEXT_MED}; background: {C.PANEL2}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 4px; padding: 6px;"
+        )
+        self._out.setWordWrap(True)
+        self._out.setFixedHeight(64)
+        lay.addWidget(self._out)
+
+        self._reload()  # populate connection fields + trigger rows (seeds JARVIS set)
+
+    # ── data plumbing ────────────────────────────────────────────────────────
+
+    def _set_out(self, text: str):
+        if text == "__RELOAD__":
+            self._reload()
+            return
+        self._out.setText(str(text)[:600])
+
+    def _preset_key(self, t: dict) -> str:
+        if t.get("bridge"):
+            return "bridge"
+        tool = t.get("tool")
+        args = t.get("args") or {}
+        if tool == "system_status":
+            return "status"
+        if tool == "screen_process":
+            return "vision"
+        if tool == "open_app":
+            return "open_app"
+        if tool == "computer_settings":
+            return {"lock": "lock", "sleep": "sleep", "shutdown": "shutdown"}.get(
+                str(args.get("action", "")).lower(), "custom")
+        # brain presets: match by the preset's fixed text prefix
+        text = str(t.get("text", ""))
+        for p in self._vt.PRESETS:
+            base = p.get("text")
+            if p.get("mode") == "brain" and base and text.startswith(base[:40]):
+                return p["key"]
+        return "custom"
+
+    def _details_for(self, t: dict, key: str) -> str:
+        if key == "bridge":
+            return ""
+        if key == "open_app":
+            return str((t.get("args") or {}).get("app_name", ""))
+        if key == "custom":
+            return str(t.get("tool", "") if t.get("mode") == "tool" else t.get("text", ""))
+        preset = self._vt.PRESET_BY_KEY.get(key)
+        if preset and preset.get("mode") == "brain" and preset.get("text"):
+            base = preset["text"]
+            text = str(t.get("text", ""))
+            return text[len(base):].strip() if text.startswith(base) else ""
+        return ""
+
+    def _row_widget(self, t: dict, idx: int):
+        row = QWidget()
+        rl = QHBoxLayout(row); rl.setContentsMargins(0, 0, 0, 0); rl.setSpacing(4)
+
+        phrase = QLineEdit(str(t.get("phrase", "")))
+        phrase.setPlaceholderText("say...")
+        key = self._preset_key(t)
+        preset = QComboBox()
+        for p in self._vt.PRESETS:
+            preset.addItem(p["label"], p["key"])
+        preset.setCurrentIndex(max(0, next((i for i, p in enumerate(self._vt.PRESETS)
+                                            if p["key"] == key), 0)))
+        details = QLineEdit(self._details_for(t, key))
+        details.setPlaceholderText("Details (optional)")
+        enabled = QCheckBox()
+        enabled.setChecked(bool(t.get("enabled", True)))
+        enabled.setToolTip("On = included in commands.json")
+        rm = QPushButton("✕")
+        rm.setFixedSize(26, 26)
+        rm.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {C.TEXT_DIM}; "
+            f"border: 1px solid {C.BORDER}; border-radius: 4px; }}"
+            f"QPushButton:hover {{ color: #ff6688; border-color: #ff6688; }}"
+        )
+        for w in (phrase, preset, details):
+            w.setStyleSheet(
+                f"QWidget {{ background: #061017; color: {C.TEXT}; "
+                f"border: 1px solid {C.BORDER}; border-radius: 4px; padding: 4px; }}"
+            )
+        phrase.setFont(QFont("Courier New", 8))
+        preset.setFont(QFont("Courier New", 7))
+        details.setFont(QFont("Courier New", 8))
+
+        rl.addWidget(phrase, 2)
+        rl.addWidget(preset, 5)
+        rl.addWidget(details, 4)
+        rl.addWidget(enabled)
+        rl.addWidget(rm)
+
+        def _save(*_):
+            self._save_row(idx, phrase, preset, details, enabled)
+
+        def _on_preset(*_):
+            # Details only matters for custom/open_app/brain presets
+            pkey = preset.currentData() or "custom"
+            details.setEnabled(pkey not in ("bridge",) and not (
+                self._vt.PRESET_BY_KEY.get(pkey, {}).get("mode") == "tool"
+                and pkey != "open_app" and pkey != "custom"))
+            _save()
+
+        phrase.editingFinished.connect(_save)
+        preset.currentIndexChanged.connect(_on_preset)
+        details.editingFinished.connect(_save)
+        enabled.toggled.connect(_save)
+        rm.clicked.connect(lambda *_: self._remove_row(t))
+        _on_preset()
+        return row
+
+    def _trigger_from_row(self, old: dict, phrase_ed, preset_cb, details_ed,
+                          enabled_cb) -> dict:
+        key = preset_cb.currentData() or "custom"
+        t = {"phrase": phrase_ed.text().strip(),
+             "enabled": enabled_cb.isChecked()}
+        if key == "custom":
+            t["mode"] = old.get("mode", "brain")
+            if t["mode"] == "tool":
+                t["tool"] = details_ed.text().strip() or old.get("tool", "")
+            else:
+                t["text"] = details_ed.text().strip() or old.get("text", "")
+        elif key == "bridge":
+            t["mode"] = "brain"; t["bridge"] = True
+        else:
+            preset = self._vt.PRESET_BY_KEY.get(key) or {}
+            t["mode"] = preset.get("mode", "brain")
+            if preset.get("tool"):
+                t["tool"] = preset["tool"]
+            if preset.get("args"):
+                t["args"] = dict(preset["args"])
+            if key == "open_app":
+                t["args"]["app_name"] = details_ed.text().strip()
+            elif preset.get("text"):
+                det = details_ed.text().strip()
+                t["text"] = (preset["text"] + " " + det).strip()
+        return t
+
+    def _save_row(self, idx: int, phrase_ed, preset_cb, details_ed, enabled_cb):
+        triggers = self._vt.get_triggers()
+        if idx >= len(triggers):
+            return
+        t = self._trigger_from_row(triggers[idx], phrase_ed, preset_cb,
+                                   details_ed, enabled_cb)
+        if not t["phrase"]:
+            return  # keep the old row until the user types a phrase
+        triggers[idx] = t
+        self._vt.set_triggers(triggers)
+
+    def _remove_row(self, t: dict):
+        self._vt.remove_trigger(t.get("phrase", ""))
+        self._rebuild_rows()
+        self._set_out(f"Removed trigger: {t.get('phrase')}")
+
+    def _rebuild_rows(self):
+        while self._rows_lay.count():
+            item = self._rows_lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        for idx, t in enumerate(self._vt.get_triggers()):
+            self._rows_lay.addWidget(self._row_widget(t, idx))
+
+    def _reload(self):
+        """Refresh from disk; seed the JARVIS trigger set on first open."""
+        seeded = self._vt.seed_defaults()
+        block = self._vt.get_block()
+        self._token_ed.setText(block.get("token", ""))
+        self._computer_ed.setText(block.get("computer", ""))
+        self._agent_dir_ed.setText(block.get("agent_dir", ""))
+        try:
+            self._mcp_status_lbl.setText(self._vt.mcp_status()["message"])
+        except Exception:
+            pass
+        try:
+            ground, source = self._vt.resolve_ground()
+            self._ground_lbl.setText(
+                f"ground: {ground}  (from {source}) - only matching commands upload"
+            )
+        except Exception:
+            pass
+        self._rebuild_rows()
+        if seeded:
+            self._set_out(f"Seeded {seeded} JARVIS-style triggers - toggle on/off, "
+                          "then GENERATE commands.json.")
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    def _save_connection(self):
+        block = self._vt.get_block()
+        block["token"] = self._token_ed.text().strip()
+        block["computer"] = self._computer_ed.text().strip()
+        block["agent_dir"] = self._agent_dir_ed.text().strip()
+        self._vt.save_block(block)
+        self._set_out("Connection saved. Now GENERATE commands.json.")
+
+    def _link_from_composio(self):
+        """Link the TRIGGERcmd account from the user's Composio workspace.
+
+        If TRIGGERcmd is already connected in Composio, lists the computers
+        and fills the Computer field automatically. If not, starts the OAuth
+        flow (opens the browser) so the user can authorize.
+        """
+        def _work():
+            try:
+                status = self._vt.composio_status()
+                if status.get("connected"):
+                    computers = status.get("computers") or []
+                    if computers:
+                        self._vt.save_composio_computer(computers[0])
+                        msg = (f"Linked via Composio. Computer '{computers[0]}' saved."
+                               + (f" Others: {', '.join(computers[1:])}" if len(computers) > 1 else ""))
+                    else:
+                        msg = ("Linked via Composio, but no computers registered yet - "
+                               "install the TRIGGERcmd agent and run it once, then retry.")
+                else:
+                    ok, link_msg = self._vt.link_from_composio()
+                    msg = link_msg
+            except Exception as e:
+                msg = f"Composio link failed: {e}"
+            self.test_result.emit(msg)
+            self.test_result.emit("__RELOAD__")
+
+        self._set_out("Checking Composio for a TRIGGERcmd connection...")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _add_trigger(self):
+        triggers = self._vt.get_triggers()
+        triggers.append({"phrase": "", "mode": "brain", "bridge": True,
+                         "enabled": True})
+        self._vt.set_triggers(triggers)
+        self._rebuild_rows()
+        self._set_out("New trigger added - type a phrase and pick what it does.")
+
+    def _generate(self):
+        ok, msg, count = self._vt.write_commands_json()
+        try:
+            ground, source = self._vt.resolve_ground()
+            msg += f"  (ground={ground} from {source})"
+        except Exception:
+            pass
+        self._set_out(msg)
+
+    def _instructions(self):
+        self.show_doc.emit("VOICE TRIGGERS  -  FREE SETUP GUIDE", self._vt.instructions())
+
+    def _install_mcp(self):
+        """Download + configure the TRIGGERcmd MCP server (free, no IFTTT)."""
+        def _work():
+            try:
+                ok, msg = self._vt.ensure_mcp_configured()
+            except Exception as e:
+                msg = f"MCP install failed: {e}"
+            self.test_result.emit(msg)
+            self.test_result.emit("__RELOAD__")
+
+        self._set_out("Installing TRIGGERcmd MCP server - this may take a moment...")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _mcp_status(self):
+        s = self._vt.mcp_status()
+        lines = [
+            "TRIGGERCMD MCP SERVER STATUS",
+            "----------------------------",
+            f"MCP python package : {'OK' if s['mcp_package'] else 'MISSING (pip install mcp)'}",
+            f"Binary installed   : {'yes' if s['binary_installed'] else 'no'}",
+            f"Configured in cfg  : {'yes' if s['configured'] else 'no'}",
+            f"Token in config    : {'yes' if s['token_set'] else 'no (falls back to ~/.TRIGGERcmdData/token.tkn)'}",
+            f"Binary path        : {s['binary_path']}",
+            "",
+            f"Overall: {s['message']}",
+        ]
+        self.show_doc.emit("TRIGGERCMD MCP STATUS", "\n".join(lines))
+
+    def _test(self):
+        triggers = [t for t in self._vt.get_triggers() if t.get("enabled", True)]
+        if not triggers:
+            self._set_out("No enabled triggers to test.")
+            return
+        phrase = triggers[0].get("phrase", "")
+        self._set_out(f"Testing '{phrase}' - this calls Jeeves, give it a moment...")
+        threading.Thread(target=lambda: self.test_result.emit(
+            self._vt.test_run(phrase)), daemon=True).start()
+
+
 class ContentPanel(QWidget):
     """Floating panel that displays rich dynamic content (search results,
     news briefings, file summaries) without disrupting the HUD layout.
@@ -1670,6 +2130,7 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self.on_remote_clicked = None
         self._remote_overlay: RemoteKeyOverlay | None = None
+        self._voice_triggers_overlay: VoiceTriggersOverlay | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1746,6 +2207,14 @@ class MainWindow(QMainWindow):
             ow, oh = RemoteKeyOverlay._OW, RemoteKeyOverlay._OH
             cw = self.centralWidget()
             self._remote_overlay.setGeometry(
+                (cw.width()  - ow) // 2,
+                (cw.height() - oh) // 2,
+                ow, oh,
+            )
+        if self._voice_triggers_overlay and self._voice_triggers_overlay.isVisible():
+            ow, oh = VoiceTriggersOverlay._OW, VoiceTriggersOverlay._OH
+            cw = self.centralWidget()
+            self._voice_triggers_overlay.setGeometry(
                 (cw.width()  - ow) // 2,
                 (cw.height() - oh) // 2,
                 ow, oh,
@@ -2006,6 +2475,20 @@ class MainWindow(QMainWindow):
         self._remote_btn.clicked.connect(self._open_remote_dashboard)
         lay.addWidget(self._remote_btn)
 
+        self._voice_btn = QPushButton("🎛  VOICE TRIGGERS")
+        self._voice_btn.setFixedHeight(30)
+        self._voice_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        self._voice_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._voice_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #00141c; color: {C.ACC2};
+                border: 1px solid {C.ACC2}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: #001d28; }}
+        """)
+        self._voice_btn.clicked.connect(self._open_voice_triggers)
+        lay.addWidget(self._voice_btn)
+
         sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
         lay.addWidget(sep2)
@@ -2144,6 +2627,24 @@ class MainWindow(QMainWindow):
         )
         self._remote_overlay.show()
         self._remote_overlay.raise_()
+
+    def _open_voice_triggers(self):
+        """Open the Voice Triggers overlay (Google Assistant / TRIGGERcmd)."""
+        if self._voice_triggers_overlay is None:
+            self._voice_triggers_overlay = VoiceTriggersOverlay(
+                parent=self.centralWidget()
+            )
+            self._voice_triggers_overlay.show_doc.connect(self._show_content_panel)
+        self._voice_triggers_overlay._reload()
+        ow, oh = VoiceTriggersOverlay._OW, VoiceTriggersOverlay._OH
+        cw = self.centralWidget()
+        self._voice_triggers_overlay.setGeometry(
+            (cw.width()  - ow) // 2,
+            (cw.height() - oh) // 2,
+            ow, oh,
+        )
+        self._voice_triggers_overlay.show()
+        self._voice_triggers_overlay.raise_()
 
     def mark_remote_connected(self):
         """UI-side update (Qt main thread) when a phone pairs via QR/key."""

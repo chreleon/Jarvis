@@ -233,7 +233,7 @@ def _get_brain_client():
 
 # ── Tool Definitions ────────────────────────────────────────────────────────
 
-from config.tool_definitions import TOOL_DECLARATIONS, TOOL_REGISTRY
+from config.tool_definitions import TOOL_REGISTRY, compact_tool_declarations
 from core.utils import parse_tool_call
 
 # ── Graceful Shutdown ─────────────────────────────────────────────────────
@@ -327,12 +327,14 @@ def _build_system_prompt() -> str:
         parts.append(mem_str)
     parts.append(sys_prompt)
 
-    # Add tool declarations for the LLM
+    # Add tool declarations for the LLM (compact rendering — the full JSON
+    # schema is ~6k tokens per request and pushed free-tier budgets past
+    # their per-minute limit, causing 413 failures)
     parts.append(
         "\n[TOOLS]\nYou have tools available. To call one, respond with "
         'ONLY a JSON object of the form {"tool_call": {"name": "<tool_name>", "args": {...}}}. '
         "To just speak to the user, respond with plain text (no JSON). "
-        "Available tools:\n" + json.dumps(TOOL_DECLARATIONS, indent=2)
+        "Available tools:\n" + compact_tool_declarations()
     )
 
     return "\n".join(parts)

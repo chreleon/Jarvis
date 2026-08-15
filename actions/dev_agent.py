@@ -232,7 +232,7 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         result = subprocess.run(
             [sys.executable, "-m", "pip", "show", pkg_name],
-            capture_output=True, text=True
+            capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             to_install.append(dep)

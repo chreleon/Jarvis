@@ -16,19 +16,33 @@ from pathlib import Path
 
 # ── Blocked categories (never monitor regardless of what user says) ───────────
 
-_BLOCKED = {
-    # Brand / asset names — identical across languages
+# Latin-script terms get word-boundary matching so legitimate topics like
+# "cryptography" or "tokenization" are not silently blocked.
+_BLOCKED_WORDS = {
     "bitcoin", "ethereum", "dogecoin", "solana", "binance",
     "nft", "blockchain", "defi", "altcoin", "memecoin", "coin", "token",
-    # "crypto" root in several languages
-    "crypto", "kripto", "cripto", "krypto", "\u043a\u0440\u0438\u043f\u0442\u043e",
-    "\u4eee\u60f3\u901a\u8ca8", "\u6697\u53f7\u8cc7\u7522",
-    "cryptocurrency",
+    "crypto", "kripto", "cripto", "krypto", "cryptocurrency",
 }
+
+# CJK/Cyrillic terms stay as substring matches — those scripts don't
+# tokenize on whitespace the way \b expects, and the original intent was
+# "these strings, wherever they appear, mean crypto".
+_BLOCKED_SUBSTRINGS = {
+    "\u043a\u0440\u0438\u043f\u0442\u043e",  # крипто
+    "\u4eee\u60f3\u901a\u8ca8",              # 仮想通貨
+    "\u6697\u53f7\u8cc7\u7522",              # 暗号資産
+}
+
+_BLOCKED_WORD_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _BLOCKED_WORDS) + r")\b",
+    re.IGNORECASE,
+)
 
 def _is_blocked(topic: str) -> bool:
     t = topic.lower()
-    return any(word in t for word in _BLOCKED)
+    if _BLOCKED_WORD_PATTERN.search(t):
+        return True
+    return any(sub in t for sub in _BLOCKED_SUBSTRINGS)
 
 
 # ── Slug / hash helpers ───────────────────────────────────────────────────────
@@ -49,9 +63,12 @@ def _load() -> dict:
 
 def _save(monitors: dict) -> None:
     from memory.memory_manager import load_memory, MEMORY_PATH, _lock
-    memory = load_memory()
-    memory["monitors"] = monitors
+    # Read and write atomically under the same lock: loading outside it
+    # would let another writer's change between our read and write get
+    # silently overwritten by this stale snapshot.
     with _lock:
+        memory = load_memory()
+        memory["monitors"] = monitors
         MEMORY_PATH.parent.mkdir(parents=True, exist_ok=True)
         MEMORY_PATH.write_text(
             json.dumps(memory, indent=2, ensure_ascii=False),

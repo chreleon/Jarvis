@@ -74,7 +74,7 @@ try:
 except Exception:
     try:
         import subprocess
-        subprocess.run(["msg", "*", "/TIME:30", "{safe_message}"], shell=True)
+        subprocess.run(["msg", "*", "/TIME:30", "{safe_message}"], shell=True, timeout=15)
     except Exception:
         pass
 
@@ -127,7 +127,7 @@ except Exception:
 
         result = subprocess.run(
             f'schtasks /Create /TN "{task_name}" /XML "{xml_path}" /F',
-            shell=True, capture_output=True, text=True
+            shell=True, capture_output=True, text=True, timeout=15
         )
 
         try:

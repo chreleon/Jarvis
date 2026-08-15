@@ -1,5 +1,8 @@
-from __future__ import annotations
-
+# NOTE: no `from __future__ import annotations` here — FastAPI resolves
+# endpoint params like `req: Request` at function-definition time. With
+# postponed annotations + the lazy FastAPI import inside _build_app(), the
+# `Request` name is NOT in module globals, so FastAPI would misread `req`
+# as a query parameter (422) and every dashboard endpoint would break.
 import asyncio
 import json
 import secrets
@@ -66,6 +69,7 @@ class DashboardServer:
         self._command_callback = None
         self._wake_callback = None
         self._connect_callback = None
+        self._status_provider = None   # optional fn() -> dict merged into /api/status
         self._ready = False
         self._web_pin = _load_web_pin()
         self.app = None  # built lazily by _build_app() on first serve()
@@ -91,6 +95,14 @@ class DashboardServer:
 
     def set_connect_callback(self, fn) -> None:
         self._connect_callback = fn
+
+    def set_status_provider(self, fn) -> None:
+        """Register a callable returning extra live status for /api/status.
+
+        Called on every dashboard status poll (in the FastAPI thread); must
+        be cheap and never raise (exceptions are swallowed).
+        """
+        self._status_provider = fn
 
     async def broadcast(self, msg: dict) -> None:
         self._history.append(msg)
@@ -161,12 +173,13 @@ textarea,input{background:#071018;color:#e6f7ff;border:1px solid rgba(0,212,255,
 textarea{flex:1;min-height:60px;resize:vertical;padding:12px}
 button{border:0;border-radius:12px;padding:12px 14px;background:linear-gradient(90deg,#00d4ff,#00ff88);color:#001018;font-weight:800;cursor:pointer}
 .stack{padding:12px;display:grid;gap:10px}.pill{padding:12px;border-radius:14px;background:#09131a;border:1px solid rgba(0,212,255,.09)}
+.alert-body{font-size:12px;color:#9fc4d5;margin-top:4px;line-height:1.5;word-break:break-word}
 .kv{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:3px 0;color:#aec9d6}
 @media (max-width: 900px){.wrap{grid-template-columns:1fr;}.card:first-child{min-height:52vh}}
 </style></head><body>
 <div class="top"><div><div class="brand">JEEVES REMOTE</div><div class="small" id="ip">Connecting…</div></div><div class="small" id="state">IDLE</div></div>
 <div class="wrap"><div class="card"><div class="head">LIVE LOG</div><div id="log"></div><div class="composer"><textarea id="cmd" placeholder="Type a remote command..."></textarea><button id="send">Send</button></div></div>
-<div class="card"><div class="head">STATUS</div><div class="stack"><div class="pill"><div class="kv"><span>Provider</span><span id="provider">unknown</span></div><div class="kv"><span>Model</span><span id="model">unknown</span></div><div class="kv"><span>Dashboard</span><span id="url">unknown</span></div></div><div class="pill"><div class="kv"><span>Tip</span><span>Use the desktop app to generate a fresh key</span></div></div></div></div></div>
+<div class="card"><div class="head">STATUS</div><div class="stack"><div class="pill"><div class="kv"><span>Provider</span><span id="provider">unknown</span></div><div class="kv"><span>Model</span><span id="model">unknown</span></div><div class="kv"><span>Dashboard</span><span id="url">unknown</span></div></div><div class="pill"><div class="kv"><span>Monitoring</span><span id="monitors">none</span></div><div class="kv"><span>Last alert</span><span id="alert-time">—</span></div><div id="last-alert" class="alert-body">none</div></div><div class="pill"><div class="kv"><span>Tip</span><span>Use the desktop app to generate a fresh key</span></div></div></div></div></div>
 <script>
 const token=sessionStorage.getItem('jeeves_token');
 if(!token) location.href='/login';
@@ -177,13 +190,17 @@ const provider=document.getElementById('provider');
 const model=document.getElementById('model');
 const url=document.getElementById('url');
 const ip=document.getElementById('ip');
+const monitors=document.getElementById('monitors');
+const lastAlert=document.getElementById('last-alert');
+const alertTime=document.getElementById('alert-time');
 function esc(s){return String(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));}
 function append(cls,who,text){const d=document.createElement('div');d.className='msg '+cls;d.innerHTML='<strong>'+esc(who)+'</strong><br>'+esc(text);log.appendChild(d);log.scrollTop=log.scrollHeight;}
-async function refresh(){const r=await fetch('/api/status',{headers:auth});const j=await r.json();ip.textContent=j.url||'';provider.textContent=j.provider||'unknown';model.textContent=j.model||'unknown';url.textContent=j.url||'unknown';state.textContent=j.state||'IDLE';}
+function fmtAlert(a){if(!a)return 'none';const first=(String(a).split('\\n')[0]||'').replace(/^\\[[^\\]]*\\]\\s*/,'').trim();return first.slice(0,140)||'none';}
+async function refresh(){const r=await fetch('/api/status',{headers:auth});const j=await r.json();ip.textContent=j.url||'';provider.textContent=j.provider||'unknown';model.textContent=j.model||'unknown';url.textContent=j.url||'unknown';state.textContent=j.state||'IDLE';monitors.textContent=(j.monitors&&j.monitors.length)?j.monitors.join(', ').slice(0,90):'none';lastAlert.textContent=fmtAlert(j.last_alert);alertTime.textContent=j.last_alert_at?new Date(j.last_alert_at*1000).toLocaleTimeString():'—';}
 function wsConnect(){const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='log') append(m.speaker||'sys',m.speaker||'SYS',m.text||''); if(m.type==='status') state.textContent=m.state||'IDLE'; if(m.type==='sys') append('sys','SYS',m.text||''); if(m.type==='status') state.textContent=m.state||'IDLE';};ws.onclose=()=>setTimeout(wsConnect,1000);}
 document.getElementById('send').onclick=async()=>{const t=document.getElementById('cmd');const txt=t.value.trim();if(!txt)return;t.value='';append('user','You',txt);await fetch('/api/command',{method:'POST',headers:auth,body:JSON.stringify({text:txt})});};
 document.getElementById('cmd').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('send').click();}});
-refresh();wsConnect();
+refresh();wsConnect();setInterval(refresh,10000);
 </script></body></html>"""
 
         @app.get("/login", response_class=HTMLResponse)
@@ -281,7 +298,18 @@ refresh();wsConnect();
         async def status(req: Request):
             if not _auth(req):
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
-            return JSONResponse({"ok": True, "url": self.get_url(), "state": "online", "provider": "jeeves", "model": "jeeves"})
+            payload = {
+                "ok": True, "url": self.get_url(), "state": "online",
+                "provider": "jeeves", "model": "jeeves",
+            }
+            if self._status_provider is not None:
+                try:
+                    extra = self._status_provider() or {}
+                    if isinstance(extra, dict):
+                        payload.update(extra)
+                except Exception:
+                    pass   # live status must never break the dashboard
+            return JSONResponse(payload)
 
         @app.post("/api/command")
         async def command(req: Request):

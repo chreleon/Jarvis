@@ -168,6 +168,9 @@ class EdgeTTSEngine:
                 ["ffmpeg", "-i", "pipe:0", "-f", "s16le", "-ac", "1",
                  "-ar", str(OUTPUT_SAMPLE_RATE), "pipe:1"],
                 input=mp3, capture_output=True, check=True,
+                # A wedged ffmpeg must never hang the TTS hot path forever —
+                # on timeout we fall through to the MP3-decoder error below.
+                timeout=30,
             )
             if proc.stdout:
                 return proc.stdout

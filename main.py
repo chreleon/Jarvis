@@ -14,7 +14,7 @@ from memory.memory_manager import (
     should_extract_memory, extract_memory
 )
 from memory_cleanup import cleanup as cleanup_jeeves
-from config.tool_definitions import TOOL_DECLARATIONS
+from config.tool_definitions import compact_tool_declarations
 from core.utils import get_provider_api_key, normalize_api_key
 
 # NOTE: action modules (file_processor, browser_control, composio_agent, ...)
@@ -46,11 +46,30 @@ VISION_COOLDOWN_S      = 12   # minimum gap between screen_process calls
 
 # Hard ceilings so a slow/hung call can never silence Jeeves for good.
 BRAIN_TIMEOUT_S        = 240  # LLM reasoning call (voice turn or tool follow-up)
+ALERT_BRAIN_TIMEOUT_S  = 30   # alert rephrasing must stay snappy — the raw
+                              # alert text is always a safe fallback, so
+                              # there's no reason to wait through a full
+                              # Groq recovery cycle just to phrase one sentence
 # 240s (not 90s) so the Groq key pool can exhaust ALL keys through its
 # recovery windows (RECOVERY_RETRIES x MAX_RECOVERY_WAIT_S ~= 210s) without
 # the app cutting the turn off mid-exhaustion. Still bounded — a genuinely
 # hung call surfaces "taking longer than usual" after 4 minutes.
 TOOL_TIMEOUT_S         = 120  # any tool run_in_executor call
+
+# Conversation context budget sent to the brain. Unbounded history + verbatim
+# tool results were pushing requests to ~10.5k tokens, which blew past the
+# free-tier per-minute token budget and produced the endless 413 "Payload Too
+# Large" failures. These caps keep every request small and cheap.
+HISTORY_WINDOW_TURNS  = 10    # conversation turns sent to the brain
+MAX_MSG_CHARS         = 2500  # per-message cap inside the brain context
+MAX_HISTORY_CHARS     = 4000  # total cap for the trimmed conversation — sized so
+                              # that even the worst case (maxed memory + maxed
+                              # history) stays under the 6k-token per-minute
+                              # budget with the 2k output allowance
+TOOL_RESULT_CHARS     = 1200  # tool results kept in history (the rest is dropped)
+BRAIN_MAX_TOKENS      = 2048  # output cap for voice turns — replies are short,
+                              # and a big reserved max_tokens counts against the
+                              # per-minute budget even when unused
 
 
 def _get_api_key() -> str:
@@ -232,6 +251,28 @@ class JeevesLive:
         self.ui.write_log(f"SYS: Remote dashboard key generated — {url} (key: {key})")
         return url, key, f"{url}/auto-login?key={key}", manual
 
+    def _dashboard_extra_status(self) -> dict:
+        """Live status for the remote dashboard: monitored topics + last alert.
+
+        Called from the FastAPI thread on every status poll. Cheap: topics
+        are a memory read, last alert is a stored attribute. Never raises.
+        """
+        monitors: list[str] = []
+        try:
+            monitors = _load_runtime_imports()["list_monitors"]() or []
+        except Exception:
+            pass
+        last_alert = None
+        last_alert_at = None
+        if self._sys_monitor is not None:
+            last_alert    = getattr(self._sys_monitor, "last_alert", None)
+            last_alert_at = getattr(self._sys_monitor, "last_alert_at", None)
+        return {
+            "monitors": monitors,
+            "last_alert": last_alert,
+            "last_alert_at": last_alert_at,
+        }
+
     def set_speaking(self, value: bool):
         with self._speaking_lock:
             self._is_speaking = value
@@ -291,15 +332,40 @@ class JeevesLive:
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        # Compact tool list (~1.5k tokens vs ~6k for the full JSON schema) —
+        # enough for the model to choose and fill parameters correctly while
+        # keeping requests inside the free-tier token budget.
         parts.append(
             "\n[TOOLS]\nYou have tools available. To call one, respond with "
             "ONLY a JSON object of the form "
             '{"tool_call": {"name": "<tool_name>", "args": {...}}}. '
             "To just speak to the user, respond with plain text (no JSON). "
-            "Available tools:\n" + json.dumps(TOOL_DECLARATIONS, indent=2)
+            "Available tools:\n" + compact_tool_declarations()
         )
 
         return "\n".join(parts)
+
+    def _trim_context(self, messages: list[dict]) -> list[dict]:
+        """Cap per-message and total size of the conversation sent to the brain.
+
+        Long tool results / file / web outputs bloat a turn to thousands of
+        tokens; a few such turns push the request past the model's token
+        budget (413) and stall the whole pipeline. Trimming keeps requests
+        small. The newest message (the current utterance) is always kept.
+        """
+        trimmed: list[dict] = []
+        budget = MAX_HISTORY_CHARS
+        for m in reversed(messages):
+            content = m.get("content") or ""
+            if isinstance(content, str) and len(content) > MAX_MSG_CHARS:
+                # cap includes the ellipsis marker, so result <= MAX_MSG_CHARS
+                content = content[:MAX_MSG_CHARS - 1] + "…"
+            cost = len(content) + 64  # small overhead for role/structure
+            if trimmed and budget - cost < 0:
+                break
+            budget -= cost
+            trimmed.append({**m, "content": content})
+        return list(reversed(trimmed))
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         args = dict(args or {})
@@ -578,10 +644,12 @@ class JeevesLive:
 
         try:
             system_prompt = self._build_system_prompt()
+            context = self._trim_context(self.conversation[-HISTORY_WINDOW_TURNS:])
             reply = await asyncio.wait_for(
                 asyncio.to_thread(
                     _get_brain_client().multi_turn,
-                    [{"role": "system", "content": system_prompt}] + self.conversation[-20:],
+                    [{"role": "system", "content": system_prompt}] + context,
+                    max_tokens=BRAIN_MAX_TOKENS,
                 ),
                 timeout=BRAIN_TIMEOUT_S,
             )
@@ -625,15 +693,17 @@ class JeevesLive:
             else:
                 self.conversation.append({
                     "role": "user",
-                    "content": f"[TOOL RESULT for {tool_name}]: {result}\n"
+                    "content": f"[TOOL RESULT for {tool_name}]: {str(result)[:TOOL_RESULT_CHARS]}\n"
                                f"Now reply to the user naturally in one or two sentences."
                 })
                 try:
                     system_prompt = self._build_system_prompt()
+                    context = self._trim_context(self.conversation[-HISTORY_WINDOW_TURNS:])
                     followup = await asyncio.wait_for(
                         asyncio.to_thread(
                             _get_brain_client().multi_turn,
-                            [{"role": "system", "content": system_prompt}] + self.conversation[-20:],
+                            [{"role": "system", "content": system_prompt}] + context,
+                            max_tokens=BRAIN_MAX_TOKENS,
                         ),
                         timeout=BRAIN_TIMEOUT_S,
                     )
@@ -841,8 +911,9 @@ class JeevesLive:
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": alert},
                     ],
+                    wait_for_recovery=False,
                 ),
-                timeout=BRAIN_TIMEOUT_S,
+                timeout=ALERT_BRAIN_TIMEOUT_S,
             )
             reply = (reply or "").strip()
             # Never speak raw tool-call JSON — fall back to the alert text.
@@ -852,7 +923,7 @@ class JeevesLive:
             await self._speak_async(reply)
             self.ui.write_log("SYS: Monitor alert spoken.")
         except Exception as e:
-            print(f"[JEEVES] Alert: {e}")
+            print(f"[JEEVES] Alert failed ({type(e).__name__}): {e}")
             try:
                 first = self._alert_first_line(alert)
                 if first:
@@ -864,11 +935,15 @@ class JeevesLive:
         """Background task: voice alerts when hardware metrics cross thresholds."""
         while True:
             await asyncio.sleep(10)
+            if self._loop is None or self._loop.is_closed():
+                return   # app shutting down — stop scheduling work
             try:
                 if self._sys_monitor is None:
                     self._sys_monitor = _load_runtime_imports()["SystemMonitor"]()
                 alert = await asyncio.to_thread(self._sys_monitor.check)
             except Exception as e:
+                if "shutdown" in str(e).lower():
+                    return
                 print(f"[JEEVES] System monitor: {e}")
                 continue
             if not alert:
@@ -886,6 +961,8 @@ class JeevesLive:
         """Check user-configured topics once per day; speak alerts on new headlines."""
         await asyncio.sleep(300)          # wait 5 min after startup before first check
         while True:
+            if self._loop is None or self._loop.is_closed():
+                return   # app shutting down — stop scheduling work
             try:
                 with self._speaking_lock:
                     speaking = self._is_speaking
@@ -899,6 +976,8 @@ class JeevesLive:
                         await self._speak_alert(alert)
                         await asyncio.sleep(6)   # gap between consecutive alerts
             except Exception as e:
+                if "shutdown" in str(e).lower():
+                    return
                 print(f"[JEEVES] Background monitor: {e}")
             await asyncio.sleep(1800)     # re-check every 30 minutes
 
@@ -907,6 +986,7 @@ class JeevesLive:
         try:
             self._dashboard = DashboardServer()
             self._dashboard.set_command_callback(self._on_remote_command)
+            self._dashboard.set_status_provider(self._dashboard_extra_status)
             self._dashboard.set_wake_callback(lambda: self.ui.write_log("SYS: Remote wake received."))
 
             def _on_remote_connected():

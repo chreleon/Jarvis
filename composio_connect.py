@@ -18,6 +18,7 @@ _APP_MAP = {
     "github":         "GITHUB",
     "gmail":          "GMAIL",
     "googlecalendar": "GOOGLECALENDAR",
+    "triggercmd":     "TRIGGERCMD",
 }
 
 

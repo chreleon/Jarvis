@@ -14,9 +14,12 @@ CONFIG_DIR = BASE_DIR / "config"
 API_FILE = CONFIG_DIR / "api_keys.json"
 
 
-def _run(command: list[str], title: str) -> None:
+def _run(command: list[str], title: str, timeout: int = 600) -> None:
 	print(f"\n== {title} ==")
-	subprocess.run(command, cwd=BASE_DIR, check=True)
+	try:
+		subprocess.run(command, cwd=BASE_DIR, check=True, timeout=timeout)
+	except subprocess.TimeoutExpired:
+		print(f"\n⚠️ {title} timed out after {timeout}s — rerun setup.py to retry.")
 
 
 def _run_doctor() -> None:
@@ -26,6 +29,7 @@ def _run_doctor() -> None:
 		cwd=BASE_DIR,
 		text=True,
 		capture_output=True,
+		timeout=60,
 	)
 	if result.stdout:
 		print(result.stdout)
@@ -56,7 +60,7 @@ def main() -> None:
 	_run_doctor()
 
 	_run([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "Installing requirements")
-	_run([sys.executable, "-m", "playwright", "install"], "Installing Playwright browsers")
+	_run([sys.executable, "-m", "playwright", "install"], "Installing Playwright browsers", timeout=900)
 	_ensure_config_stub()
 
 	print("\n== Downloading voice model ==")
