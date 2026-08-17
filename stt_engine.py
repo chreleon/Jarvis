@@ -22,6 +22,8 @@ os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
 
+import threading
+
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -59,15 +61,18 @@ STT_DEVICE = "cpu"   # "cuda" if an NVIDIA GPU is available
 print(f"[STT] Auto-selected: {STT_MODEL_SIZE} / {STT_COMPUTE}")
 
 _model = None
-
+_model_lock = threading.Lock()   # guards lazy load (startup prewarm may race first transcribe)
 
 
 def _get_model() -> WhisperModel:
     global _model
-    if _model is None:
-        print(f"[STT] Loading faster-whisper ({STT_MODEL_SIZE}, {STT_DEVICE}/{STT_COMPUTE})...")
-        _model = WhisperModel(STT_MODEL_SIZE, device=STT_DEVICE, compute_type=STT_COMPUTE)
-        print("[STT] Model ready.")
+    if _model is not None:
+        return _model
+    with _model_lock:
+        if _model is None:
+            print(f"[STT] Loading faster-whisper ({STT_MODEL_SIZE}, {STT_DEVICE}/{STT_COMPUTE})...")
+            _model = WhisperModel(STT_MODEL_SIZE, device=STT_DEVICE, compute_type=STT_COMPUTE)
+            print("[STT] Model ready.")
     return _model
 
 

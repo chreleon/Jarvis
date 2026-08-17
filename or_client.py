@@ -56,8 +56,47 @@ def _load_config() -> dict:
         raise RuntimeError(f"Failed to load brain config: {e}")
 
 
-GROQ_DEFAULT_MODEL  = "llama-3.3-70b-versatile"
-GROQ_LITE_MODEL     = "llama-3.1-8b-instant"
+# ── Config cache (YinYang) ────────────────────────────────────────────────────
+# The Groq key pool reads api_keys.json on every current()/advance()/size() —
+# i.e. on every brain request AND every retry. The file is small, but re-
+# opening + re-parsing it per request is pure waste. Cache it keyed on
+# (mtime_ns, size): editing the file (adding/removing keys) bumps mtime, so
+# the "keys picked up immediately, no restart" contract is preserved exactly
+# while steady-state requests do zero disk I/O.
+_config_cache: dict | None = None
+_config_mtime_ns: int = -1
+_config_size: int = -1
+
+
+def _load_config_cached() -> dict:
+    global _config_cache, _config_mtime_ns, _config_size
+    try:
+        st = os.stat(API_KEY_PATH)
+        if (_config_cache is not None
+                and st.st_mtime_ns == _config_mtime_ns
+                and st.st_size == _config_size):
+            return _config_cache
+    except OSError:
+        pass  # fall through: let _load_config raise the canonical error
+    cfg = _load_config()
+    try:
+        st = os.stat(API_KEY_PATH)
+        _config_mtime_ns, _config_size = st.st_mtime_ns, st.st_size
+    except OSError:
+        pass
+    _config_cache = cfg
+    return cfg
+
+
+# Current Groq text models (verified against the API on 2026-08-17):
+#   * the older llama-3.3-70b-versatile / llama-3.1-8b-instant ids now
+#     return 404 "model_not_found" on free keys
+#   * groq/compound 413s on Jeeves' full system prompt (~14k chars) — its
+#     input cap is too small, so the flagship is openai/gpt-oss-120b, which
+#     accepts the full prompt and answers correctly (verified live)
+#   * openai/gpt-oss-20b is the lite model (accepts the full prompt, fast)
+GROQ_DEFAULT_MODEL  = "openai/gpt-oss-120b"
+GROQ_LITE_MODEL     = "openai/gpt-oss-20b"
 GROQ_TEXT_MODELS    = (GROQ_DEFAULT_MODEL, GROQ_LITE_MODEL)
 GITHUB_DEFAULT_MODEL = "gpt-4.1-mini"
 GITHUB_TEXT_MODELS   = ("gpt-4.1-mini", "gpt-4.1", "gpt-4o-mini", "gpt-4o")
@@ -121,7 +160,7 @@ class _GroqKeyPool:
 
     def _keys(self) -> list[str]:
         try:
-            return normalize_api_key_list(_load_config().get("groq_api_key", ""))
+            return normalize_api_key_list(_load_config_cached().get("groq_api_key", ""))
         except Exception:
             return []
 
@@ -277,7 +316,10 @@ class ClaudeClient:
         # one-shot invocations and the daemon don't pay for it up front).
         from groq import Groq
 
-        return Groq(api_key=_groq_pool.current())
+        # Explicit timeout: the SDK's default is 10 minutes — a hung
+        # connection would block the CLI/daemon request thread for that long.
+        # 60s is plenty for a completion and bounds every failure (daktari).
+        return Groq(api_key=_groq_pool.current(), timeout=60.0)
 
     def _groq_create(self, model, max_tokens, temperature, messages, wait_for_recovery: bool = True) -> str:
         """Call Groq with automatic key rotation + wait-for-recovery retry.
@@ -473,11 +515,17 @@ class ClaudeClient:
     def _shrink_messages(messages: list, limit: int = 3000) -> list:
         """Truncate oversized message content in place of a retry.
 
-        The cap includes the trim marker, so the result is at most `limit`
-        chars."""
+        The system message is preserved verbatim: it carries the tool
+        declarations, and chopping its tail after a 413 retry is exactly
+        what made Jeeves reply "I don't have any tools available" (the tools
+        live at the end of the prompt). Conversation messages are trimmed;
+        the cap includes the trim marker, so each is at most `limit` chars."""
         suffix = "\n…[trimmed]"
         out = []
         for m in messages:
+            if m.get("role") == "system":
+                out.append(m)
+                continue
             content = m.get("content")
             if isinstance(content, str) and len(content) > limit:
                 content = content[:limit - len(suffix)].rstrip() + suffix
@@ -520,13 +568,35 @@ class ClaudeClient:
             )
         )
 
+    @staticmethod
+    def _is_model_error(error: Exception) -> bool:
+        """Detect "model does not exist / no access" errors.
+
+        Groq renames/retires model ids over time (llama-3.3-70b-versatile now
+        returns 404 model_not_found), so a stale or renamed model id must be
+        treated as retryable-across-candidates: try the next model in the
+        pool (e.g. the lite model) instead of hard-failing every request.
+        """
+        message = str(error).lower()
+        return any(
+            token in message
+            for token in (
+                "model_not_found",
+                "model does not exist",
+                "not found",
+                "no access",
+                "model_not_accessible",
+            )
+        )
+
     def _is_transient_error(self, error: Exception) -> bool:
         """Return True for errors that should allow trying a fallback provider.
 
         This includes capacity/rate-limit errors and auth/token-expiry errors
         that we want to recover from by switching providers.
         """
-        return self._is_capacity_error(error) or self._is_auth_error(error)
+        return (self._is_capacity_error(error) or self._is_auth_error(error)
+                or self._is_model_error(error))
 
     def _candidate_models(self, model: str | None) -> list[str]:
         candidates = []
@@ -650,7 +720,13 @@ class ClaudeClient:
 
     def vision(self, prompt, image_b64, mime="image/png", system="Analyze the image and describe what you see clearly and concisely.", model=None, max_tokens=1024) -> str:
         self._ensure_loaded()
-        vision_model = "gpt-4.1" if self.provider == "github_models" else "llama-3.2-90b-vision-preview"
+        # An explicit `model` wins; otherwise use the current recommended
+        # vision model per provider. The previous Groq default
+        # (llama-3.2-90b-vision-preview) was decommissioned and now returns
+        # 400 model_decommissioned, which broke the still-image fallback.
+        vision_model = model or (
+            "gpt-4.1" if self.provider == "github_models" else "qwen/qwen3.6-27b"
+        )
         messages = [{"role": "user", "content": [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{image_b64}"}},

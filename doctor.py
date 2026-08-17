@@ -105,9 +105,10 @@ def check_brain_key(config: dict):
 
     try:
         from groq import Groq
+        from or_client import GROQ_LITE_MODEL
         client = Groq(api_key=key)
         client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model=GROQ_LITE_MODEL,
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=1,
         )

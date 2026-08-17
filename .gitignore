@@ -25,6 +25,26 @@ jeeves_daemon.log
 voices/
 test_silence.wav
 
+# ── Secretary background monitor (WhatsApp Web bridge) ──────────────────
+.whatsapp_profile/
+qr_login.png
+
+# Files the boss drops into the self-chat (WhatsApp → PC, like /attach)
+whatsapp_media/
+
+# Phone control screenshots / pulled files
+phone_shots/
+phone_pulls/
+
+# ── Phone unlock fail-safe — LOCAL ONLY, NEVER COMMIT (can be misused) ──
+actions/phone_unlock.py
+config/phone_vault.json
+config/phone_unlock_state.json
+tests/test_phone_unlock.py
+
+# Phone identity profile (serial + last endpoint — personal device info)
+config/phone_profile.json
+
 # ── Node ────────────────────────────────────────────────────────────────
 node_modules/
 
@@ -42,3 +62,6 @@ _tmp_*.py
 
 # ── Local reference copy of the project (not part of the app) ──────────
 markl-reference/
+
+# ── Termux SSH bridge (Jeeves → phone shell) ─────────────────────────
+config/termux_keys/

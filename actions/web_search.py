@@ -31,40 +31,159 @@ def _llm_query(query: str, system: str) -> str:
 
 # ── DuckDuckGo backends ──────────────────────────────────────────────────────
 
+def _ddg_html(query: str, max_results: int = 8) -> list[dict]:
+    """requests-only DuckDuckGo HTML fallback (no ddgs package needed).
+
+    The html endpoint serves static markup (.result__a links) with no JS,
+    so search — and the background monitor's `_ddg_news` — never silently
+    fail when the ddgs package is missing or the SDK errors. Best-effort:
+    DDG may serve an anomaly page, in which case this returns [] and
+    callers degrade gracefully.
+    """
+    import re
+    import urllib.parse
+    import requests
+
+    try:
+        url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote_plus(query)
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return _bing_html(query, max_results)
+
+    results: list[dict] = []
+    for m in re.finditer(
+        r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+        resp.text, re.S,
+    ):
+        if len(results) >= max_results:
+            break
+        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        if title:
+            results.append({"title": title, "url": m.group(1), "snippet": ""})
+    # DDG may serve an anomaly page or be unreachable (times out on some
+    # networks) — fall back to Bing's HTML endpoint, same result shape.
+    return results or _bing_html(query, max_results)
+
+
+def _bing_html(query: str, max_results: int = 8) -> list[dict]:
+    """Bing HTML search (requests-only) — fallback when DDG is unreachable.
+
+    Bing wraps result links in /ck/a redirects, so the visible cite URL is
+    returned instead of the redirect target. Same {title,url,snippet} shape
+    as the DDG backends, so callers (web search, the news monitor, the
+    anime Netflix check) can use it interchangeably.
+    """
+    import re
+    import urllib.parse
+    import requests
+
+    try:
+        url = "https://www.bing.com/search?q=" + urllib.parse.quote_plus(query)
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                   "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"},
+            timeout=8,
+        )
+        resp.raise_for_status()
+    except Exception:
+        return []
+
+    results: list[dict] = []
+    for item in re.findall(r'<li class="b_algo".*?</li>', resp.text, re.S):
+        if len(results) >= max_results:
+            break
+        m = re.search(r"<h2[^>]*><a[^>]*>(.*?)</a>", item, re.S)
+        title = re.sub(r"<[^>]+>", "", m.group(1)).strip() if m else ""
+        c = re.search(r"<cite[^>]*>(.*?)</cite>", item, re.S)
+        cite = re.sub(r"<[^>]+>", "", c.group(1)).strip() if c else ""
+        a = re.search(r'<a[^>]*href="([^"]+)"', item)
+        url = _bing_redirect_target(a.group(1)) if a else (cite or "")
+        s = re.search(r"<p[^>]*b_lineclamp[^>]*>(.*?)</p>", item, re.S)
+        snippet = re.sub(r"<[^>]+>", "", s.group(1)).strip() if s else ""
+        if title:
+            results.append({"title": title, "url": url, "snippet": snippet})
+    return results
+
+
+def _bing_redirect_target(href: str) -> str:
+    """Decode a Bing /ck/a redirect to the real destination URL.
+
+    Bing wraps result links as https://www.bing.com/ck/a?...&u=a1<base64>...
+    where a1 + base64 encodes the target URL. Falls back to the href
+    unchanged when the format doesn't match.
+    """
+    import base64
+    import re
+    href = href.replace("&amp;", "&")
+    m = re.search(r"[?&]u=a1([A-Za-z0-9+/=]+)", href)
+    if not m:
+        return href
+    try:
+        return base64.b64decode(m.group(1) + "==").decode("utf-8", "ignore")
+    except Exception:
+        return href
+
+
 def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return _ddg_html(query, max_results)
 
     results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("href",   ""),
-            })
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    "title":   r.get("title",  ""),
+                    "snippet": r.get("body",   ""),
+                    "url":     r.get("href",   ""),
+                })
+    except Exception:
+        return _ddg_html(query, max_results)
     return results
 
 
 def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
-    """DDG news search -- returns actual articles, not website homepages."""
+    """DDG news search -- returns actual articles, not website homepages.
+
+    Falls back to the HTML endpoint (web results for '<query> news') when
+    the ddgs SDK is missing or errors, so background monitoring still works.
+    """
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return _ddg_html(f"{query} news", max_results)
 
     results = []
-    with DDGS() as ddgs:
-        for r in ddgs.news(query, max_results=max_results):
-            results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("url",    ""),
-                "date":    r.get("date",   ""),
-                "source":  r.get("source", ""),
-            })
+    try:
+        with DDGS() as ddgs:
+            for r in ddgs.news(query, max_results=max_results):
+                results.append({
+                    "title":   r.get("title",  ""),
+                    "snippet": r.get("body",   ""),
+                    "url":     r.get("url",    ""),
+                    "date":    r.get("date",   ""),
+                    "source":  r.get("source", ""),
+                })
+    except Exception:
+        html = _ddg_html(f"{query} news", max_results)
+        for r in html:
+            r["source"] = "web"
+            r.setdefault("date", "")
+        return html
     return results
 
 

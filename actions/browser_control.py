@@ -7,17 +7,32 @@ import subprocess
 from pathlib import Path
 
 # playwright is heavy (~1.4s cold import) and only needed when a browser
-# session is actually started — loaded lazily on first use (PEP 562).
+# session is actually started — loaded lazily on first use via the
+# _get_playwright()/_get_playwright_timeout() accessors. NOTE: explicit
+# accessors are required — a module-level __getattr__ (PEP 562) can't
+# serve bare `async_playwright` names inside this module's own functions
+# (LOAD_GLOBAL never consults it).
 _playwright_api = None
 
-def __getattr__(name: str):
+
+def _ensure_playwright():
+    """Lazily import playwright's async API; cached as a tuple."""
     global _playwright_api
-    if name in ("async_playwright", "PlaywrightTimeout"):
-        if _playwright_api is None:
-            from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
-            _playwright_api = (async_playwright, PlaywrightTimeout)
-        return _playwright_api[0] if name == "async_playwright" else _playwright_api[1]
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    if _playwright_api is None:
+        from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
+        _playwright_api = (async_playwright, PlaywrightTimeout)
+
+
+def _get_playwright():
+    """Lazily import playwright and return its async_playwright entrypoint."""
+    _ensure_playwright()
+    return _playwright_api[0]
+
+
+def _get_playwright_timeout():
+    """Lazily import playwright and return its timeout exception type."""
+    _ensure_playwright()
+    return _playwright_api[1]
 
 
 def _get_default_browser_id() -> str:
@@ -277,7 +292,7 @@ class _BrowserThread:
         self._loop.run_forever()
 
     async def _init(self):
-        self._playwright = await async_playwright().start()
+        self._playwright = await _get_playwright()().start()
 
     def run(self, coro, timeout: int = 30):
         if self._init_error:
@@ -375,7 +390,7 @@ class _BrowserThread:
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=15000)
             return f"Opened: {page.url}"
-        except PlaywrightTimeout:
+        except _get_playwright_timeout():
             return f"Timeout loading: {url}"
         except Exception as e:
             return f"Navigation error: {e}"
@@ -399,7 +414,7 @@ class _BrowserThread:
                 await page.click(selector, timeout=8000)
                 return f"Clicked: {selector}"
             return "No selector or text provided."
-        except PlaywrightTimeout:
+        except _get_playwright_timeout():
             return "Element not found or not clickable."
         except Exception as e:
             return f"Click error: {e}"

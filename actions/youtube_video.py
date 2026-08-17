@@ -11,7 +11,10 @@ from urllib.parse import quote_plus
 import numpy as np
 
 # requests is heavy (~1.2s cold) and only needed for network calls —
-# loaded lazily on first use (PEP 562 __getattr__).
+# loaded lazily on first use via _get_requests(). NOTE: this must be an
+# explicit accessor — a module-level __getattr__ (PEP 562) can't serve
+# bare `requests` names inside this module's own functions (LOAD_GLOBAL
+# never consults it), so call sites use `_get_requests().X`.
 _requests = None
 _REQUESTS_OK = False
 _requests_loaded = False
@@ -31,12 +34,11 @@ def _ensure_requests() -> bool:
     return _REQUESTS_OK
 
 
-def __getattr__(name: str):
-    global _requests
-    if name == "requests":
-        _ensure_requests()
-        return _requests
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _get_requests():
+    """Lazily import requests and return it; raises if unavailable."""
+    if not _ensure_requests():
+        raise RuntimeError("requests not installed. Run: pip install requests")
+    return _requests
 
 try:
     from youtube_transcript_api import YouTubeTranscriptApi
@@ -90,7 +92,7 @@ def _scrape_first_video_url(query: str) -> str | None:
     )
 
     try:
-        r    = requests.get(search_url, headers=HEADERS, timeout=10)
+        r    = _get_requests().get(search_url, headers=HEADERS, timeout=10)
         html = r.text
 
         video_ids = re.findall(r'"videoId":"([A-Za-z0-9_-]{11})"', html)
@@ -224,7 +226,7 @@ def _scrape_video_info(video_id: str) -> dict:
         return {}
     url = f"https://www.youtube.com/watch?v={video_id}"
     try:
-        r    = requests.get(url, headers=HEADERS, timeout=12)
+        r    = _get_requests().get(url, headers=HEADERS, timeout=12)
         html = r.text
         info = {}
 
@@ -257,7 +259,7 @@ def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
         return []
     url = f"https://www.youtube.com/feed/trending?gl={region.upper()}"
     try:
-        r    = requests.get(url, headers=HEADERS, timeout=12)
+        r    = _get_requests().get(url, headers=HEADERS, timeout=12)
         html = r.text
 
         titles   = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"\}\]', html)

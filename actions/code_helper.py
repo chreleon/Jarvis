@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 
 from actions.remote_runner import remote_execution_enabled, remote_run_command, run_script_file
-from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH, subprocess_no_window_kwargs
 
 DESKTOP            = Path.home() / "Desktop"
 MAX_BUILD_ATTEMPTS = 3
@@ -214,7 +214,8 @@ def _run_file(path: Path, args: list, timeout: int) -> str:
             interp + [str(path)] + (args or []),
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
-            timeout=timeout, cwd=str(path.parent)
+            timeout=timeout, cwd=str(path.parent),
+            **subprocess_no_window_kwargs(),
         )
         output = result.stdout.strip()
         error  = result.stderr.strip()

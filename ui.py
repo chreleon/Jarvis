@@ -20,8 +20,8 @@ from PyQt6.QtCore import (
 )
 from PyQt6.QtGui import (
     QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QFontDatabase,
-    QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen, QPixmap,
-    QRadialGradient, QShortcut,
+    QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath, QPen,
+    QPixmap, QRadialGradient, QShortcut,
 )
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
@@ -29,7 +29,11 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH as API_FILE
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH as API_FILE, subprocess_no_window_kwargs
+from config.tool_tips import tool_tutorial, random_tip_entry
+
+# JARVIS-style holo orb renderer (pure QPainter, no heavy deps).
+from holo_orb import draw_holo_orb
 
 _DEFAULT_W, _DEFAULT_H = 980, 700
 _MIN_W,     _MIN_H     = 820, 580
@@ -61,6 +65,18 @@ class C:
     WHITE     = "#d8f8ff"
     DARK      = "#000d14"
     BAR_BG    = "#011520"
+
+
+_APP_ICON: "QIcon | None" = None
+
+
+def _app_icon() -> QIcon:
+    """The Jeeves app icon (jeeves.ico), cached; empty QIcon if missing."""
+    global _APP_ICON
+    if _APP_ICON is None:
+        icon_path = BASE_DIR / "jeeves.ico"
+        _APP_ICON = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
+    return _APP_ICON
 
 
 def qcol(h: str, a: int = 255) -> QColor:
@@ -132,12 +148,14 @@ class _SysMetrics:
 
     def _get_gpu(self) -> float:
         """GPU probe — only called every 15s now instead of every 1.5s."""
-        # NVIDIA
+        # NVIDIA — the no_window kwargs stop a console window from flashing
+        # every probe (this runs every 15s while the HUD is up).
         try:
             r = subprocess.run(
                 ["nvidia-smi", "--query-gpu=utilization.gpu",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=2
+                capture_output=True, text=True, timeout=2,
+                **subprocess_no_window_kwargs(),
             )
             if r.returncode == 0:
                 vals = [float(v.strip()) for v in r.stdout.strip().split("\n") if v.strip()]
@@ -230,7 +248,8 @@ class _SysMetrics:
                 r = subprocess.run(
                     ["powershell", "-Command",
                      "(Get-WmiObject MSAcpi_ThermalZoneTemperature -Namespace root/wmi).CurrentTemperature"],
-                    capture_output=True, text=True, timeout=3
+                    capture_output=True, text=True, timeout=3,
+                    **subprocess_no_window_kwargs(),
                 )
                 if r.returncode == 0 and r.stdout.strip():
                     raw = float(r.stdout.strip().split("\n")[0])
@@ -265,6 +284,9 @@ class HudCanvas(QWidget):
       4. Pre-computed waveform heights — random() moved out of paintEvent
     """
 
+    # Emits the masked face PNG bytes when the background loader finishes.
+    _face_ready_sig = pyqtSignal(bytes)
+
     def __init__(self, face_path: str, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
@@ -274,6 +296,16 @@ class HudCanvas(QWidget):
         self.muted    = False
         self.speaking = False
         self.state    = "INITIALISING"
+
+        # HUD center visual: 'face' (default) or 'holo' (JARVIS wireframe
+        # orb). Opt-in via config/api_keys.json: {"hud_style": "holo"}.
+        # The face orb is untouched when unset — nothing is removed.
+        self.holo_mode = False
+        try:
+            cfg = json.loads(API_FILE.read_text(encoding="utf-8"))
+            self.holo_mode = str(cfg.get("hud_style", "face")).lower() == "holo"
+        except Exception:
+            self.holo_mode = False
 
         # ── YinYang: per-frame cached values ──
         self._tick            = 0
@@ -309,6 +341,7 @@ class HudCanvas(QWidget):
         self._last_frame_w = 0
         self._last_frame_h = 0
 
+        self._face_ready_sig.connect(self._apply_face)
         self._load_face(face_path)
 
         self._tmr = QTimer(self)
@@ -316,21 +349,38 @@ class HudCanvas(QWidget):
         self._tmr.start(self._speaking_frame_interval if self.speaking else self._idle_frame_interval)
 
     def _load_face(self, path: str):
-        try:
-            from PIL import Image, ImageDraw
-            import io
-            img = Image.open(path).convert("RGBA")
-            sz  = min(img.size)
-            img = img.resize((sz, sz), Image.LANCZOS)
-            mk  = Image.new("L", (sz, sz), 0)
-            ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
-            img.putalpha(mk)
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue())
-            self._face_px = px
-        except Exception:
-            self._face_px = None
+        """Load + circular-mask the HUD face off the UI thread.
+
+        PIL and the image ops cost ~0.3s; doing them in a thread lets the
+        window appear immediately (the orb fallback paints until the face
+        arrives, then _apply_face swaps it in).
+        """
+        def _work():
+            try:
+                from PIL import Image, ImageDraw
+                import io
+                img = Image.open(path).convert("RGBA")
+                sz  = min(img.size)
+                img = img.resize((sz, sz), Image.LANCZOS)
+                mk  = Image.new("L", (sz, sz), 0)
+                ImageDraw.Draw(mk).ellipse((2, 2, sz - 2, sz - 2), fill=255)
+                img.putalpha(mk)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                self._face_ready_sig.emit(buf.getvalue())
+            except Exception:
+                self._face_ready_sig.emit(b"")
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _apply_face(self, data: bytes):
+        """Set the loaded face pixmap on the UI thread and repaint."""
+        if data:
+            px = QPixmap()
+            if px.loadFromData(data) and not px.isNull():
+                self._face_px = px
+        self._cached_fsz    = 0          # force re-scale on next paint
+        self._cached_face   = QPixmap()
+        self.update()
 
     # ── YinYang: cache invalidation on resize ──
     def resizeEvent(self, event):
@@ -518,11 +568,14 @@ class HudCanvas(QWidget):
 
         r_face = fw * 0.31
 
-        # halo glow (always redrawn — alpha varies per frame)
+        # halo glow (alpha varies per frame — skip rings too faint to see;
+        # at idle halo~50 the outer 7 rings have alpha < 3, i.e. invisible)
         for i in range(10):
-            r   = r_face * (1.8 - i * 0.08)
             frc = 1.0 - i / 10
             a   = max(0, min(255, int(self._halo * 0.085 * frc)))
+            if a < 3:
+                continue
+            r   = r_face * (1.8 - i * 0.08)
             col = qcol(C.MUTED_C if self.muted else C.PRI, a)
             p.setPen(QPen(col, 1.5)); p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
@@ -561,7 +614,15 @@ class HudCanvas(QWidget):
         p.drawArc(srect, int(self._scan2 * 16), int(ex * 16))
 
         # ── YinYang: cached face scaling ──
-        if self._face_px:
+        if self.holo_mode:
+            # JARVIS wireframe holo-orb in the center (arc-reactor rings,
+            # halo and scanners all stay — only the center visual swaps).
+            draw_holo_orb(
+                p, cx, cy, fw * 0.30 * self._scale,
+                t=self._tick * 0.033, speaking=self.speaking,
+                muted=self.muted,
+            )
+        elif self._face_px:
             fsz = int(fw * 0.62 * self._scale)
             if fsz != self._cached_fsz or self._cached_face.isNull():
                 self._cached_fsz = fsz
@@ -694,12 +755,20 @@ class LogWidget(QTextEdit):
 
     YinYang optimization: batch characters (write 8 per tick instead of 1).
     This reduces QTextCursor operations by ~8x and eliminates per-character signal overhead.
+
+    Tool tips ("TIP: ..." lines, appended via append_tip) are rendered as
+    clickable links carrying jeeves://tool/<name>; clicking one emits
+    tipClicked(tool_name) so the HUD can open the full tutorial in the
+    content panel. Clicks are detected with QTextEdit.anchorAt (the
+    anchorClicked signal was removed from QTextEdit in Qt 6.11).
     """
     _sig = pyqtSignal(str)
+    tipClicked = pyqtSignal(str)   # tool name of the clicked tip link
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setReadOnly(True)
+        self._tip_tool: str = ""   # tool name for the next queued TIP line
         self.setFont(QFont("Courier New", 9))
         self.setStyleSheet(f"""
             QTextEdit {{
@@ -734,6 +803,11 @@ class LogWidget(QTextEdit):
     def append_log(self, text: str):
         self._sig.emit(text)
 
+    def append_tip(self, text: str, tool: str):
+        """Log a tool tip as a clickable link to the tool's tutorial."""
+        self._tip_tool = tool or ""
+        self.append_log(text)
+
     def _enqueue(self, text: str):
         self._queue.append(text)
         if not self._typing:
@@ -750,6 +824,7 @@ class LogWidget(QTextEdit):
         if   tl.startswith("you:"):    self._tag = "you"
         elif tl.startswith("jeeves:"): self._tag = "ai"
         elif tl.startswith("file:"):   self._tag = "file"
+        elif tl.startswith("tip:"):    self._tag = "tip"
         elif "err" in tl:              self._tag = "err"
         else:                          self._tag = "sys"
         self._tmr.start(6)
@@ -775,9 +850,15 @@ class LogWidget(QTextEdit):
             "ai":   qcol(C.PRI),
             "err":  qcol(C.RED),
             "file": qcol(C.GREEN),
+            "tip":  qcol("#ffcc66"),
             "sys":  qcol(C.ACC2),
         }.get(self._tag, qcol(C.TEXT))
         fmt.setForeground(QBrush(col))
+        if self._tag == "tip" and self._tip_tool:
+            # Whole line becomes a link: clicking opens the tool tutorial.
+            fmt.setAnchor(True)
+            fmt.setAnchorHref(f"jeeves://tool/{self._tip_tool}")
+            fmt.setFontUnderline(True)
 
         end = min(self._pos + self._batch_size, len(self._text))
         chunk = self._text[self._pos:end]
@@ -785,6 +866,16 @@ class LogWidget(QTextEdit):
         self.setTextCursor(cur)
         self.ensureCursorVisible()
         self._pos = end
+        if self._pos >= len(self._text):
+            self._tip_tool = ""   # link consumed — reset for the next line
+
+    def mouseReleaseEvent(self, e):
+        super().mouseReleaseEvent(e)
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        href = self.anchorAt(e.position().toPoint())
+        if href.startswith("jeeves://tool/"):
+            self.tipClicked.emit(href[len("jeeves://tool/"):])
 
 
 _FILE_ICONS = {
@@ -2107,13 +2198,16 @@ class ContentPanel(QWidget):
 # above (HudCanvas, LogWidget, FileDropZone, _SysMetrics) cover the hot paths.
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
+    _tip_sig   = pyqtSignal(str, str)   # (tool_name, display_text) for clickable tips
     _state_sig = pyqtSignal(str)
     _remote_sig = pyqtSignal()
     _content_sig = pyqtSignal(str, str)
+    _brain_status_sig = pyqtSignal()
 
     def __init__(self, face_path: str):
         super().__init__()
         self.setWindowTitle("J.E.E.V.E.S — MARK XXXIX")
+        self.setWindowIcon(_app_icon())
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -2131,6 +2225,9 @@ class MainWindow(QMainWindow):
         self.on_remote_clicked = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._voice_triggers_overlay: VoiceTriggersOverlay | None = None
+        # Mirrored onto the window too: GUI-typed commands (_send) fire this
+        # so they reach external sinks (e.g. the dashboard) like voice lines.
+        self.on_log = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -2140,6 +2237,7 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self._build_header())
+        root.addWidget(self._build_tip_banner())
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -2170,9 +2268,12 @@ class MainWindow(QMainWindow):
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._tip_sig.connect(self._log_tip)
+        self._log.tipClicked.connect(self._on_tip_clicked)
         self._state_sig.connect(self._apply_state)
         self._remote_sig.connect(self.mark_remote_connected)
         self._content_sig.connect(self._show_content_panel)
+        self._brain_status_sig.connect(self._apply_brain_status)
 
         self._content_panel = ContentPanel(central)
         self._content_panel._apply_geometry(central)
@@ -2322,22 +2423,37 @@ class MainWindow(QMainWindow):
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
 
     def _refresh_brain_status(self):
-        try:
-            from or_client import client as brain_client
-            provider = str(getattr(brain_client, "provider", "unknown")).upper()
-            try:
-                model_info = brain_client.available_models() or {}
-            except Exception:
-                model_info = {}
-            model_value = model_info.get("active_text_model")
-            if not model_value:
-                text_models = model_info.get("text_models") or ["unknown"]
-                model_value = text_models[0]
-            model = str(model_value).upper()
-        except Exception:
-            provider = "UNKNOWN"
-            model = "UNKNOWN"
+        """Refresh provider/model labels without stalling window build.
 
+        Importing or_client (the brain) costs ~0.5s; it happens in a
+        background thread and the labels update via signal when ready.
+        """
+        def _load():
+            try:
+                from or_client import client as brain_client
+                self._brain_client_ref = brain_client
+            except Exception:
+                self._brain_client_ref = None
+            self._brain_status_sig.emit()
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _apply_brain_status(self):
+        brain_client = getattr(self, "_brain_client_ref", None)
+        provider, model = "UNKNOWN", "UNKNOWN"
+        if brain_client is not None:
+            try:
+                provider = str(getattr(brain_client, "provider", "unknown")).upper()
+                try:
+                    model_info = brain_client.available_models() or {}
+                except Exception:
+                    model_info = {}
+                model_value = model_info.get("active_text_model")
+                if not model_value:
+                    text_models = model_info.get("text_models") or ["unknown"]
+                    model_value = text_models[0]
+                model = str(model_value).upper()
+            except Exception:
+                pass
         if hasattr(self, "_provider_lbl"):
             self._provider_lbl.setText(f"PROV  {provider}")
         if hasattr(self, "_model_lbl"):
@@ -2430,6 +2546,25 @@ class MainWindow(QMainWindow):
         lay.addWidget(_sec("ACTIVITY LOG"))
         self._log = LogWidget()
         lay.addWidget(self._log, stretch=1)
+
+        # Collapsible TIPS section: expanded by default; click the header
+        # to reclaim log space.
+        self._tips_btn = QPushButton("▾ TIPS — QUICK COMMANDS")
+        self._tips_btn.setCheckable(True)
+        self._tips_btn.setChecked(True)
+        self._tips_btn.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        self._tips_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tips_btn.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left; padding: 2px 4px;
+                background: transparent; color: {C.TEXT_MED}; border: none;
+            }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        self._tips_btn.toggled.connect(self._toggle_tips)
+        lay.addWidget(self._tips_btn)
+        self._tips_box = self._build_tips_section()
+        lay.addWidget(self._tips_box)
         # Register provider-change callback to surface provider switches in the UI log
         try:
             from or_client import client as brain_client
@@ -2529,6 +2664,109 @@ class MainWindow(QMainWindow):
         lay.addWidget(fs_btn)
 
         return w
+
+    def _build_tip_banner(self) -> QWidget:
+        """Slim rotating tip-of-the-moment banner under the header.
+
+        Shows a random smart-shortcut tip (rotated every 60s, like the remote
+        dashboard) and is clickable to open the tool's full tutorial in the
+        content panel — same flow as the clickable tips in the log.
+        """
+        w = QWidget()
+        w.setFixedHeight(26)
+        w.setStyleSheet(f"background: {C.PANEL2}; border-bottom: 1px solid {C.BORDER};")
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(14, 0, 14, 0)
+        lay.setSpacing(8)
+
+        tag = QLabel("💡 TIP")
+        tag.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
+        tag.setStyleSheet(f"color: {C.ACC2}; background: transparent;")
+        lay.addWidget(tag)
+
+        self._tip_banner_tool: str = ""
+        self._tip_banner_btn = QPushButton("")
+        self._tip_banner_btn.setFlat(True)
+        self._tip_banner_btn.setFont(QFont("Courier New", 8))
+        self._tip_banner_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tip_banner_btn.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left; padding: 0; border: none;
+                background: transparent; color: {C.TEXT_MED};
+            }}
+            QPushButton:hover {{ color: {C.PRI}; }}
+        """)
+        self._tip_banner_btn.clicked.connect(
+            lambda: self._on_tip_clicked(self._tip_banner_tool)
+        )
+        lay.addWidget(self._tip_banner_btn, stretch=1)
+
+        self._tip_banner_tmr = QTimer(self)
+        self._tip_banner_tmr.timeout.connect(self._rotate_tip_banner)
+        self._tip_banner_tmr.start(60_000)
+        self._rotate_tip_banner()
+        return w
+
+    def _rotate_tip_banner(self):
+        """Pick a fresh random tip for the banner (rotates every 60s)."""
+        try:
+            tool, tip = random_tip_entry()
+            self._tip_banner_tool = tool
+            tip = tip.replace("\n", " ")
+            if len(tip) > 110:
+                tip = tip[:109] + "…"
+            self._tip_banner_btn.setText(tip)
+        except Exception:
+            pass
+
+    def _toggle_tips(self, visible: bool):
+        """Expand/collapse the side-panel TIPS list."""
+        self._tips_box.setVisible(visible)
+        self._tips_btn.setText(("▾" if visible else "▸") + " TIPS — QUICK COMMANDS")
+
+    def _build_tips_section(self) -> QWidget:
+        """Compact scrollable list of smart-shortcut tips for the side panel.
+
+        Each row is 'phrase — what it does' (rich text for two colors).
+        Content comes from the shared config/tool_tips.SHORTCUT_TIPS so it
+        stays in sync with any other surface that lists shortcuts.
+        """
+        from config.tool_tips import SHORTCUT_TIPS
+
+        wrap = QWidget()
+        wrap.setFixedHeight(112)
+        wrap.setStyleSheet(f"background: {C.PANEL2}; border: 1px solid {C.BORDER}; border-radius: 4px;")
+        outer = QVBoxLayout(wrap)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical { background: %s; width: 6px; border: none; }
+            QScrollBar::handle:vertical { background: %s; border-radius: 3px; min-height: 20px; }
+        """ % (C.BG, C.BORDER_B))
+
+        content = QWidget()
+        v = QVBoxLayout(content)
+        v.setContentsMargins(8, 5, 8, 5)
+        v.setSpacing(3)
+        for phrase, what in SHORTCUT_TIPS:
+            row = QLabel()
+            row.setTextFormat(Qt.TextFormat.RichText)
+            row.setText(
+                f"<b style='color:{C.PRI};'>{phrase}</b>"
+                f" <span style='color:{C.TEXT_MED};'>— {what}</span>"
+            )
+            row.setFont(QFont("Courier New", 7))
+            row.setWordWrap(True)
+            v.addWidget(row)
+        v.addStretch()
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+        return wrap
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
@@ -2651,6 +2889,20 @@ class MainWindow(QMainWindow):
         if self._remote_overlay and self._remote_overlay.isVisible():
             self._remote_overlay.mark_connected()
 
+    def _log_tip(self, tool: str, text: str):
+        """UI-thread slot: append a tool tip as a clickable log line."""
+        self._log.append_tip(text, tool)
+
+    def _on_tip_clicked(self, tool: str):
+        """A tool tip link was clicked — open the full /tools-style tutorial."""
+        tool = str(tool or "").strip()
+        if not tool:
+            return
+        text = tool_tutorial(tool)
+        if not text:
+            text = f"No tutorial for '{tool}'."
+        self._show_content_panel(f"TOOL TUTORIAL — {tool}", text)
+
     def _show_content_panel(self, title: str, body: str):
         """UI-thread slot: populate + reveal the dynamic content panel."""
         panel = getattr(self, "_content_panel", None)
@@ -2693,7 +2945,15 @@ class MainWindow(QMainWindow):
         txt = self._input.text().strip()
         if not txt: return
         self._input.clear()
-        self._log.append_log(f"You: {txt}")
+        # Mirror GUI-typed commands to the dashboard (via on_log) the same
+        # way voice utterances do, so both sides stay in sync.
+        self._log_sig.emit(f"You: {txt}")
+        cb = getattr(self, "on_log", None)
+        if cb:
+            try:
+                cb(f"You: {txt}")
+            except Exception:
+                pass
         if self.on_text_command:
             threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
 
@@ -2833,9 +3093,25 @@ class JeevesUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        self._app.setWindowIcon(_app_icon())  # taskbar icon while running
         self._win = MainWindow(face_path)
         self._win.show()
         self.root = _RootShim(self._app)
+        # Optional callback mirroring every HUD log line (tool tips included)
+        # to an external sink (e.g. the remote dashboard). Called from
+        # whatever thread logged the line — the sink must be thread-safe.
+        self._on_log = None
+
+    @property
+    def on_log(self):
+        return self._on_log
+
+    @on_log.setter
+    def on_log(self, cb):
+        self._on_log = cb
+        # Mirrored onto the window too: GUI-typed commands (_send) fire it
+        # so they reach external sinks like the dashboard.
+        self._win.on_log = cb
 
     @property
     def muted(self) -> bool:
@@ -2879,6 +3155,26 @@ class JeevesUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+        cb = getattr(self, "on_log", None)
+        if cb:
+            try:
+                cb(text)
+            except Exception:
+                pass
+        # Keep the window's copy in sync for GUI-typed commands (_send).
+        self._win.on_log = cb
+
+    def write_tool_tip(self, tool: str, text: str):
+        """Thread-safe: log a clickable tool tip (click → tutorial panel)."""
+        self._win._tip_sig.emit(tool, text)
+        cb = getattr(self, "on_log", None)
+        if cb:
+            try:
+                # Pass the tool name so sinks (e.g. the dashboard) can make
+                # the tip line clickable to its tutorial.
+                cb(text, tool)
+            except Exception:
+                pass
 
     def mark_remote_connected(self):
         """Thread-safe: tell the QR overlay a phone connected."""

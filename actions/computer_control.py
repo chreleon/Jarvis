@@ -9,8 +9,13 @@ import time
 import random
 from pathlib import Path
 
+from core.utils import subprocess_no_window_kwargs
+
 # pyautogui is heavy (~1s cold, ~13MB) and only needed for actual input
-# actions — loaded lazily on first use (PEP 562 __getattr__).
+# actions — loaded lazily on first use via _get_pyautogui(). NOTE: this
+# must be an explicit accessor — a module-level __getattr__ (PEP 562) can't
+# serve bare `pyautogui` names inside this module's own functions
+# (LOAD_GLOBAL never consults it), so call sites use `_get_pyautogui().X`.
 _pyautogui = None
 _PYAUTOGUI = False
 _pyautogui_loaded = False
@@ -22,22 +27,21 @@ def _ensure_pyautogui() -> bool:
     if not _pyautogui_loaded:
         _pyautogui_loaded = True
         try:
-            import pyautogui
-            pyautogui.FAILSAFE = True
-            pyautogui.PAUSE    = 0.05
-            _pyautogui = pyautogui
+            import pyautogui as _pg
+            _pg.FAILSAFE = True
+            _pg.PAUSE    = 0.05
+            _pyautogui = _pg
             _PYAUTOGUI = True
         except ImportError:
             _PYAUTOGUI = False
     return _PYAUTOGUI
 
 
-def __getattr__(name: str):
-    global _pyautogui
-    if name == "pyautogui":
-        _ensure_pyautogui()
-        return _pyautogui
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _get_pyautogui():
+    """Lazily import pyautogui and return it; raises if unavailable."""
+    if not _ensure_pyautogui():
+        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+    return _pyautogui
 
 try:
     import pyperclip
@@ -162,14 +166,12 @@ def _user_profile() -> dict:
     return {}
 
 def _type(text: str, interval: float = 0.03) -> str:
-    _require_pyautogui()
     time.sleep(0.3)
-    pyautogui.typewrite(text, interval=interval)
+    _get_pyautogui().typewrite(text, interval=interval)
     return f"Typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _smart_type(text: str, clear_first: bool = True) -> str:
-    _require_pyautogui()
     if clear_first:
         _clear_field()
         time.sleep(0.1)
@@ -177,52 +179,46 @@ def _smart_type(text: str, clear_first: bool = True) -> str:
     if len(text) > 20 and _PYPERCLIP:
         pyperclip.copy(text)
         time.sleep(0.1)
-        pyautogui.hotkey("ctrl", "v")
+        _get_pyautogui().hotkey("ctrl", "v")
         return f"Smart-typed (clipboard): {text[:60]}{'…' if len(text) > 60 else ''}"
 
-    pyautogui.typewrite(text, interval=0.04)
+    _get_pyautogui().typewrite(text, interval=0.04)
     return f"Smart-typed: {text[:60]}{'…' if len(text) > 60 else ''}"
 
 
 def _click(x=None, y=None, button: str = "left", clicks: int = 1) -> str:
-    _require_pyautogui()
     if x is not None and y is not None:
-        pyautogui.click(x, y, button=button, clicks=clicks)
+        _get_pyautogui().click(x, y, button=button, clicks=clicks)
         return f"{'Double-c' if clicks == 2 else 'C'}licked ({x}, {y}) [{button}]"
-    pyautogui.click(button=button, clicks=clicks)
+    _get_pyautogui().click(button=button, clicks=clicks)
     return f"Clicked at current position [{button}]"
 
 
 def _hotkey(*keys) -> str:
-    _require_pyautogui()
-    pyautogui.hotkey(*keys)
+    _get_pyautogui().hotkey(*keys)
     return f"Hotkey: {'+'.join(keys)}"
 
 
 def _press(key: str) -> str:
-    _require_pyautogui()
-    pyautogui.press(key)
+    _get_pyautogui().press(key)
     return f"Pressed: {key}"
 
 
 def _scroll(direction: str = "down", amount: int = 3) -> str:
-    _require_pyautogui()
     vertical   = direction in ("up", "down")
     clicks     = amount if direction in ("up", "right") else -amount
-    pyautogui.scroll(clicks) if vertical else pyautogui.hscroll(clicks)
+    _get_pyautogui().scroll(clicks) if vertical else _get_pyautogui().hscroll(clicks)
     return f"Scrolled {direction} ×{amount}"
 
 
 def _move(x: int, y: int, duration: float = 0.3) -> str:
-    _require_pyautogui()
-    pyautogui.moveTo(x, y, duration=duration)
+    _get_pyautogui().moveTo(x, y, duration=duration)
     return f"Mouse → ({x}, {y})"
 
 
 def _drag(x1: int, y1: int, x2: int, y2: int, duration: float = 0.5) -> str:
-    _require_pyautogui()
-    pyautogui.moveTo(x1, y1, duration=0.2)
-    pyautogui.dragTo(x2, y2, duration=duration, button="left")
+    _get_pyautogui().moveTo(x1, y1, duration=0.2)
+    _get_pyautogui().dragTo(x2, y2, duration=duration, button="left")
     return f"Dragged ({x1},{y1}) → ({x2},{y2})"
 
 
@@ -238,25 +234,22 @@ def _clipboard_paste(text: str) -> str:
     if _PYPERCLIP:
         pyperclip.copy(text)
         time.sleep(0.1)
-        _require_pyautogui()
-        pyautogui.hotkey("ctrl", "v")
+        _get_pyautogui().hotkey("ctrl", "v")
         return f"Pasted: {text[:60]}{'…' if len(text) > 60 else ''}"
     return "pyperclip not available"
 
 
 def _screenshot(save_path: str | None = None) -> str:
-    _require_pyautogui()
     path = _safe_screenshot_path(save_path)
-    img  = pyautogui.screenshot()
+    img  = _get_pyautogui().screenshot()
     img.save(str(path))
     return f"Screenshot saved: {path}"
 
 
 def _clear_field() -> str:
-    _require_pyautogui()
-    pyautogui.hotkey("ctrl", "a")
+    _get_pyautogui().hotkey("ctrl", "a")
     time.sleep(0.1)
-    pyautogui.press("delete")
+    _get_pyautogui().press("delete")
     return "Field cleared"
 
 def _focus_window(title: str) -> str:
@@ -268,6 +261,7 @@ def _focus_window(title: str) -> str:
             subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                 capture_output=True, timeout=5,
+                **subprocess_no_window_kwargs(),
             )
             time.sleep(0.3)
             return f"Focused window: {title}"
@@ -318,9 +312,8 @@ def _screen_find(description: str) -> tuple[int, int] | None:
         import base64
         from or_client import client
 
-        _require_pyautogui()
-        w, h  = pyautogui.size()
-        img   = pyautogui.screenshot()
+        w, h  = _get_pyautogui().size()
+        img   = _get_pyautogui().screenshot()
         buf   = io.BytesIO()
         img.save(buf, format="PNG")
         b64 = base64.b64encode(buf.getvalue()).decode()

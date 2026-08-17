@@ -14,25 +14,30 @@ from pathlib import Path
 # cv2 (OpenCV) and mss are heavy (~10s cold import, ~26MB combined) and
 # only needed for camera/screenshot capture. They're loaded lazily on first
 # use instead of at module import, so importing this module (which happens
-# for every tool call via _load_runtime_imports) stays cheap. PEP 562
-# __getattr__ keeps every `cv2.`/`mss.` call site working unchanged.
+# for every tool call via _load_runtime_imports) stays cheap. Call sites use
+# the _get_cv2()/_get_mss() accessors below — a PEP 562 module __getattr__
+# alone would NOT work here: bare `cv2.`/`mss.` globals inside this module's
+# own functions are resolved via LOAD_GLOBAL, which never consults module
+# __getattr__ (observed NameError: 'mss' is not defined).
 _cv2 = None
 _mss = None
 
-def __getattr__(name: str):
-    global _cv2, _mss
-    if name == "cv2":
-        if _cv2 is None:
-            import cv2
-            _cv2 = cv2
-        return _cv2
-    if name == "mss":
-        if _mss is None:
-            import mss
-            import mss.tools  # noqa: F401  (needed for mss.tools.to_png)
-            _mss = mss
-        return _mss
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _get_cv2():
+    """Return the lazily-imported OpenCV module."""
+    global _cv2
+    if _cv2 is None:
+        import cv2
+        _cv2 = cv2
+    return _cv2
+
+def _get_mss():
+    """Return the lazily-imported mss module (+ mss.tools)."""
+    global _mss
+    if _mss is None:
+        import mss
+        import mss.tools  # noqa: F401  (needed for mss.tools.to_png)
+        _mss = mss
+    return _mss
 
 try:
     import PIL.Image
@@ -68,10 +73,7 @@ def _ensure_genai():
             _GENAI_OK = False
     return _GENAI_OK
 
-def get_base_dir():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    return Path(__file__).resolve().parent.parent
+from core.utils import get_base_dir
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
@@ -84,6 +86,12 @@ CHUNK_SIZE          = 1024
 IMG_MAX_W = 640
 IMG_MAX_H = 360
 JPEG_Q    = 55
+
+# How long to wait for the live session's spoken answer to arrive as a
+# transcript before falling back to the still-image analysis (which returns
+# text synchronously). The remote WhatsApp dashboard needs the description
+# as text, so the transcript is what gets returned.
+VISION_TEXT_TIMEOUT = 30
 
 SYSTEM_PROMPT = (
     "You are JEEVES like Jarvis from Iron Man movies. "
@@ -128,6 +136,7 @@ def _get_camera_index() -> int:
     print("[Camera] 🔍 No camera index in config. Auto-detecting...")
     best_index = 0
 
+    cv2 = _get_cv2()
     for idx in range(6):
         cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
         if not cap.isOpened():
@@ -170,6 +179,7 @@ def _to_jpeg(img_bytes: bytes) -> bytes:
 
 
 def _capture_screenshot() -> bytes:
+    mss = _get_mss()
     with mss.mss() as sct:
         shot      = sct.grab(sct.monitors[1])
         png_bytes = mss.tools.to_png(shot.rgb, shot.size)
@@ -177,6 +187,7 @@ def _capture_screenshot() -> bytes:
 
 
 def _capture_camera() -> bytes:
+    cv2 = _get_cv2()
     camera_index = _get_camera_index()
     cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not cap.isOpened():
@@ -209,6 +220,10 @@ class _LiveSession:
         self._ready:     threading.Event                  = threading.Event()
         self._player                                      = None
         self._send_lock: asyncio.Lock | None              = None
+        # Last completed spoken answer as text (set on turn_complete in the
+        # session's asyncio thread; read cross-thread by screen_process so
+        # the analysis can be returned to callers).
+        self._last_text: str | None                       = None
 
     def start(self, player=None):
         if self._thread and self._thread.is_alive():
@@ -304,10 +319,12 @@ class _LiveSession:
                     if chunk:
                         transcript_buf.append(chunk)
                 if sc.turn_complete:
-                    if transcript_buf and self._player:
+                    if transcript_buf:
                         full = re.sub(r'\s+', ' ', " ".join(transcript_buf)).strip()
                         if full:
-                            self._player.write_log(f"Jeeves: {full}")
+                            self._last_text = full   # readable by callers
+                            if self._player:
+                                self._player.write_log(f"Jeeves: {full}")
                             print(f"[ScreenProcess] 💬 {full}")
                     transcript_buf = []
         except Exception as e:
@@ -333,6 +350,15 @@ class _LiveSession:
         finally:
             stream.stop()
             stream.close()
+
+    @property
+    def last_text(self) -> str | None:
+        """The last completed spoken answer as text (None before any reply).
+
+        Written in the session's asyncio thread on turn_complete, read
+        cross-thread by screen_process so the analysis can be returned to
+        callers."""
+        return self._last_text
 
     def analyze(self, image_bytes: bytes, mime_type: str, user_text: str):
         if not self._loop:
@@ -361,6 +387,19 @@ def _ensure_started(player=None):
             _live._player = player
 
 
+def _clean_vision_reply(reply: str) -> str:
+    """Strip a model's <think>…</think> reasoning block, leaving the answer.
+
+    Some vision models return their chain-of-thought wrapped in think tags;
+    that internal reasoning is noise for the user (and for the WhatsApp
+    remote dashboard the reply is shown verbatim)."""
+    reply = (reply or "").strip()
+    if "<think" in reply.lower():
+        reply = re.sub(r"<think[^>]*>.*?</think>", "", reply,
+                       flags=re.DOTALL | re.IGNORECASE).strip()
+    return reply
+
+
 def _analyze_still(image_bytes: bytes, mime_type: str, user_text: str) -> str:
     """Analyze a captured frame through the shared brain client (no Gemini).
 
@@ -371,8 +410,7 @@ def _analyze_still(image_bytes: bytes, mime_type: str, user_text: str) -> str:
         from or_client import client
 
         b64 = base64.b64encode(image_bytes).decode("utf-8")
-        reply = client.vision(user_text, b64, mime=mime_type)
-        reply = (reply or "").strip()
+        reply = _clean_vision_reply(client.vision(user_text, b64, mime=mime_type))
         print(f"[ScreenProcess] 💬 {reply}")
         return reply
     except Exception as e:
@@ -385,7 +423,16 @@ def screen_process(
     response:       str | None = None,
     player=None,
     session_memory=None,
-) -> bool:
+) -> str | bool:
+    """Capture and analyze the screen or camera.
+
+    Returns the analysis TEXT (str) on success so callers can display it —
+    the remote WhatsApp dashboard shows the actual description instead of an
+    "activated" stub. The Gemini Live session also speaks the answer out
+    loud; its transcript becomes the returned text, and if it doesn't arrive
+    in time the still-image analysis (shared brain) produces the text
+    instead. Returns False on failure.
+    """
     user_text = (parameters or {}).get("text") or (parameters or {}).get("user_text", "")
     user_text = (user_text or "").strip()
     if not user_text:
@@ -394,8 +441,6 @@ def screen_process(
 
     angle = (parameters or {}).get("angle", "screen").lower().strip()
     print(f"[ScreenProcess] angle={angle!r}  text={user_text!r}")
-
-    _ensure_started(player=player)
 
     try:
         if angle == "camera":
@@ -415,6 +460,10 @@ def screen_process(
 
     # Prefer the Gemini Live session when both the package and a valid API
     # key exist; otherwise analyze the still image through the shared brain.
+    # The live session is only started once its prerequisites are confirmed:
+    # starting it unconditionally (as before) made the still-image fallback
+    # unreachable — a missing key/SDK crashed the session thread and the
+    # 20s startup timeout propagated instead of degrading gracefully.
     use_live = _ensure_genai()
     if use_live:
         try:
@@ -423,12 +472,27 @@ def screen_process(
             use_live = False
 
     if use_live:
-        _ensure_started(player=player)
-        _live.analyze(image_bytes, mime_type, user_text)
-        return True
+        try:
+            _ensure_started(player=player)
+        except Exception as e:
+            print(f"[ScreenProcess] ⚠️ Live session unavailable ({e}) — using still-image analysis")
+            use_live = False
 
-    _analyze_still(image_bytes, mime_type, user_text)
-    return True
+    if use_live:
+        before = _live.last_text
+        _live.analyze(image_bytes, mime_type, user_text)
+        # The live session speaks the answer out loud; wait for its
+        # transcript so the TEXT is returned too (the remote WhatsApp
+        # dashboard needs the description).
+        deadline = time.time() + VISION_TEXT_TIMEOUT
+        while time.time() < deadline:
+            if _live.last_text != before:
+                return _live.last_text
+            time.sleep(0.5)
+        print("[ScreenProcess] ⚠️ Live transcript timed out — analyzing still image")
+        return _analyze_still(image_bytes, mime_type, user_text)
+
+    return _analyze_still(image_bytes, mime_type, user_text)
 
 
 def warmup_session(player=None):

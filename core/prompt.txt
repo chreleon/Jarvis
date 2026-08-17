@@ -55,7 +55,6 @@ TOOL SELECTION:
   Use 'add' when the user says "monitor X", "track X", "follow X".
   Use 'remove' when the user says "stop monitoring X".
   Use 'list' when the user asks what is being monitored.
-  Never add crypto, financial, or trading topics.
 
 ALERTS (sent to you as user messages):
 - [SYSTEM_ALERT] = hardware warning (CPU/RAM/temp/GPU over threshold).

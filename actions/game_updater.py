@@ -9,13 +9,19 @@ import winreg
 from pathlib import Path
 from datetime import datetime
 
+from core.utils import subprocess_no_window_kwargs
+
 # External commands (tasklist/schtasks/shutdown/...) go through _run_cmd so
-# a wedged system service can never hang Jeeves indefinitely.
+# a wedged system service can never hang Jeeves indefinitely. No-window
+# kwargs stop console commands from flashing a terminal window over the
+# user's work — the Steam/Epic launcher launches below use Popen directly
+# and intentionally stay visible.
 _DEFAULT_CMD_TIMEOUT = 10
 
 
 def _run_cmd(*args, **kwargs):
     kwargs.setdefault("timeout", _DEFAULT_CMD_TIMEOUT)
+    kwargs.update(subprocess_no_window_kwargs())
     return subprocess.run(*args, **kwargs)
 
 

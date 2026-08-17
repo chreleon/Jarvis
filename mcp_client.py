@@ -238,6 +238,26 @@ class MCPServerConnection:
             transport = str(self.spec.get("transport") or "streamablehttp").lower()
             headers = _build_headers(self.spec)
 
+            # Fail fast when a server declares auth but the token/value
+            # resolves empty (e.g. a missing key_ref in config): an
+            # unauthenticated handshake would 401 or silently hang instead
+            # of giving the user a clear reason.
+            auth = self.spec.get("auth") or {}
+            if isinstance(auth, dict):
+                auth_type = str(auth.get("type", "")).lower()
+                if auth_type == "bearer" and not headers.get("Authorization"):
+                    raise ValueError(
+                        f"MCP server '{self.name}': bearer auth declared but no "
+                        f"token resolved (check key_ref '{auth.get('key_ref')}' "
+                        "in config/api_keys.json)"
+                    )
+                if auth_type == "header" and not headers.get(str(auth.get("name") or "")):
+                    raise ValueError(
+                        f"MCP server '{self.name}': header auth declared but no "
+                        f"value resolved (check key_ref '{auth.get('key_ref')}' "
+                        "in config/api_keys.json)"
+                    )
+
             if transport == "stdio":
                 from mcp import StdioServerParameters
                 from mcp.client.stdio import stdio_client

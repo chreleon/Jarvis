@@ -138,6 +138,10 @@ def main() -> int:
                 print(f"\n▸ {name:18s}  SKIPPED  ({note})")
                 continue
 
+            if name == "file_processor" and not Path("test_silence.wav").exists():
+                print(f"\n▸ {name:18s}  SKIPPED  (test_silence.wav fixture not present)")
+                continue
+
             runner = _ToolRunner(name, args, timeout)
             status = runner.go()
 

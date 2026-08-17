@@ -9,17 +9,24 @@ import platform
 from pathlib import Path
 from datetime import datetime
 
+from core.utils import subprocess_no_window_kwargs
+
 # External commands (osascript/gsettings/qdbus/...) go through _run_cmd so a
-# wedged system daemon can never hang Jeeves indefinitely.
+# wedged system daemon can never hang Jeeves indefinitely. No-window kwargs
+# stop console commands from flashing a terminal window over the user's work.
 _DEFAULT_CMD_TIMEOUT = 10
 
 
 def _run_cmd(*args, **kwargs):
     kwargs.setdefault("timeout", _DEFAULT_CMD_TIMEOUT)
+    kwargs.update(subprocess_no_window_kwargs())
     return subprocess.run(*args, **kwargs)
 
 # pyautogui is heavy (~1s cold, ~13MB) and only needed for actual desktop
-# actions — loaded lazily on first use (PEP 562 __getattr__).
+# actions — loaded lazily on first use via _get_pyautogui(). NOTE: this
+# must be an explicit accessor — a module-level __getattr__ (PEP 562) can't
+# serve bare `pyautogui` names inside this module's own functions
+# (LOAD_GLOBAL never consults it), so call sites use `_get_pyautogui().X`.
 _pyautogui = None
 _PYAUTOGUI = False
 _pyautogui_loaded = False
@@ -31,20 +38,19 @@ def _ensure_pyautogui() -> bool:
     if not _pyautogui_loaded:
         _pyautogui_loaded = True
         try:
-            import pyautogui
-            _pyautogui = pyautogui
+            import pyautogui as _pg
+            _pyautogui = _pg
             _PYAUTOGUI = True
         except ImportError:
             _PYAUTOGUI = False
     return _PYAUTOGUI
 
 
-def __getattr__(name: str):
-    global _pyautogui
-    if name == "pyautogui":
-        _ensure_pyautogui()
-        return _pyautogui
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def _get_pyautogui():
+    """Lazily import pyautogui and return it; raises if unavailable."""
+    if not _ensure_pyautogui():
+        raise RuntimeError("PyAutoGUI not installed. Run: pip install pyautogui")
+    return _pyautogui
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -87,7 +93,7 @@ def _build_sandbox() -> dict:
     }
 
     if _ensure_pyautogui():
-        sandbox["pyautogui"] = pyautogui
+        sandbox["pyautogui"] = _get_pyautogui()
 
     if _OS == "Windows":
         try:

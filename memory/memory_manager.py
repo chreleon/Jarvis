@@ -35,11 +35,34 @@ def _empty_memory() -> dict:
     }
 
 
+# ── Cache (YinYang) ────────────────────────────────────────────────────────────
+# load_memory() runs on every LLM turn (main call + tool follow-up), each time
+# re-reading + re-parsing long_term.json from disk. Cache it keyed on
+# (mtime_ns, size): any write (update_memory, auto-extraction) bumps mtime, so
+# freshness is preserved while steady-state turns do zero disk I/O. All writes
+# go through this module's own lock, so the cache is never torn mid-update.
+_memory_cache: dict | None = None
+_memory_cache_mtime_ns: int = -1
+_memory_cache_size: int = -1
+
+
 def load_memory() -> dict:
-    if not MEMORY_PATH.exists():
-        return _empty_memory()
+    global _memory_cache, _memory_cache_mtime_ns, _memory_cache_size
 
     with _lock:
+        try:
+            st = MEMORY_PATH.stat()
+            if (_memory_cache is not None
+                    and st.st_mtime_ns == _memory_cache_mtime_ns
+                    and st.st_size == _memory_cache_size):
+                return _memory_cache
+        except OSError:
+            pass  # file missing — fall through to the normal empty path
+
+        if not MEMORY_PATH.exists():
+            _memory_cache = None
+            return _empty_memory()
+
         try:
             data = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -47,6 +70,12 @@ def load_memory() -> dict:
                 for key in base:
                     if key not in data:
                         data[key] = {}
+                _memory_cache = data
+                try:
+                    st = MEMORY_PATH.stat()
+                    _memory_cache_mtime_ns, _memory_cache_size = st.st_mtime_ns, st.st_size
+                except OSError:
+                    pass
                 return data
             return _empty_memory()
         except Exception as e:

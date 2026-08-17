@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 from actions.remote_runner import remote_execution_enabled, remote_run_command
-from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH
+from core.utils import get_base_dir, BASE_DIR, CONFIG_PATH, subprocess_no_window_kwargs
 
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
@@ -232,7 +232,8 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
         result = subprocess.run(
             [sys.executable, "-m", "pip", "show", pkg_name],
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=30,
+            **subprocess_no_window_kwargs(),
         )
         if result.returncode != 0:
             to_install.append(dep)
@@ -256,7 +257,8 @@ def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
             [sys.executable, "-m", "pip", "install"] + to_install,
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
-            timeout=120, cwd=str(project_dir)
+            timeout=120, cwd=str(project_dir),
+            **subprocess_no_window_kwargs(),
         )
         if result.returncode == 0:
             return f"Installed: {', '.join(to_install)}"
@@ -276,7 +278,6 @@ def _open_vscode(project_dir: Path) -> bool:
         try:
             subprocess.Popen(
                 [cmd, str(project_dir)],
-                shell=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -305,7 +306,8 @@ def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
             timeout=timeout,
-            cwd=str(project_dir)
+            cwd=str(project_dir),
+            **subprocess_no_window_kwargs(),
         )
 
         stdout = result.stdout.strip()
@@ -342,7 +344,8 @@ def _try_auto_install(error_output: str, project_dir: Path) -> bool:
             [sys.executable, "-m", "pip", "install", pkg],
             capture_output=True, text=True,
             encoding="utf-8", errors="replace",
-            timeout=60, cwd=str(project_dir)
+            timeout=60, cwd=str(project_dir),
+            **subprocess_no_window_kwargs(),
         )
         return result.returncode == 0
     except Exception:

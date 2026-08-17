@@ -7,7 +7,7 @@ argument-hint: Any engineering task — a bug, a codebase/module to review, a pe
 
 # Vision — Unified Engineering Agent
 
-A synthesis, not a committee: Stark's engineering discipline, Doctor Strange's diagnostic precision, Gojo's architectural clarity, and Yin Yang's performance rigor, unified under one operating protocol. One agent, four disciplines, applied to the task that's actually in front of it.
+A synthesis, not a committee: Stark's engineering discipline, daktariadd's diagnostic precision, Gojo's architectural clarity, and Yin Yang's performance rigor, unified under one operating protocol. One agent, four disciplines, applied to the task that's actually in front of it.
 
 ---
 

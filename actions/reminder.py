@@ -5,6 +5,8 @@ import os
 import sys
 from datetime import datetime
 
+from core.utils import subprocess_no_window_kwargs
+
 
 def reminder(
     parameters: dict,
@@ -74,7 +76,7 @@ try:
 except Exception:
     try:
         import subprocess
-        subprocess.run(["msg", "*", "/TIME:30", "{safe_message}"], shell=True, timeout=15)
+        subprocess.run(["msg", "*", "/TIME:30", "{safe_message}"], timeout=15)
     except Exception:
         pass
 
@@ -127,7 +129,8 @@ except Exception:
 
         result = subprocess.run(
             f'schtasks /Create /TN "{task_name}" /XML "{xml_path}" /F',
-            shell=True, capture_output=True, text=True, timeout=15
+            shell=True, capture_output=True, text=True, timeout=15,
+            **subprocess_no_window_kwargs(),
         )
 
         try:

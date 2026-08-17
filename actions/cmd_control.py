@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from core.utils import get_api_config
+from core.utils import get_api_config, subprocess_no_window_kwargs
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -259,6 +259,7 @@ def cmd_control(
             encoding="utf-8",
             errors="replace",
             timeout=30,
+            **subprocess_no_window_kwargs(),
         )
 
         stdout = result.stdout.strip()

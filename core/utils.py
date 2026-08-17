@@ -156,3 +156,18 @@ def get_provider_api_key(provider: str | None = None) -> str:
 
     # default to groq
     return normalize_api_key(cfg.get("groq_api_key", "") or "")
+
+
+def subprocess_no_window_kwargs() -> dict:
+    """Extra kwargs so a subprocess never flashes a console window (Windows).
+
+    Console apps (nvidia-smi, powershell, cmd, msg, ffmpeg, ...) briefly pop
+    a new console window on Windows when spawned without this flag — over a
+    desktop session that blinks and steals focus. Pass as
+    ``**subprocess_no_window_kwargs()`` into ``subprocess.run`` / ``Popen``
+    for background work. Returns {} on non-Windows, so call sites stay
+    cross-platform.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}

@@ -15,6 +15,7 @@ from memory.memory_manager import (
 )
 from memory_cleanup import cleanup as cleanup_jeeves
 from config.tool_definitions import compact_tool_declarations
+from config.tool_tips import get_tool_tip, random_tip_entry
 from core.utils import get_provider_api_key, normalize_api_key
 
 # NOTE: action modules (file_processor, browser_control, composio_agent, ...)
@@ -33,6 +34,17 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
+
+
+def _dashboard_speaker(text: str) -> str:
+    """Map a HUD log line to a dashboard speaker (you/jeeves/sys)."""
+    t = (text or "").lstrip()
+    low = t.lower()
+    if low.startswith("you:"):
+        return "you"
+    if low.startswith("jeeves:"):
+        return "jeeves"
+    return "sys"   # SYS:, TIP:, FILE:, ERR:, anything else
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 22050
@@ -84,9 +96,26 @@ def _get_api_key() -> str:
             or normalize_api_key(data.get("gemini_api_key", "") or "")
 
 
+# Cached with an mtime check: _build_system_prompt() runs on EVERY LLM turn
+# (main call + tool follow-up), so without caching each turn re-reads
+# core/prompt.txt from disk. Editing the file bumps mtime → re-read happens
+# automatically, keeping correctness.
+_prompt_cache: str | None = None
+_prompt_mtime_ns: int = -1
+_prompt_size: int = -1
+
+
 def _load_system_prompt() -> str:
+    global _prompt_cache, _prompt_mtime_ns, _prompt_size
     try:
-        return PROMPT_PATH.read_text(encoding="utf-8")
+        st = PROMPT_PATH.stat()
+        if (_prompt_cache is not None
+                and st.st_mtime_ns == _prompt_mtime_ns
+                and st.st_size == _prompt_size):
+            return _prompt_cache
+        text = PROMPT_PATH.read_text(encoding="utf-8")
+        _prompt_cache, _prompt_mtime_ns, _prompt_size = text, st.st_mtime_ns, st.st_size
+        return text
     except Exception:
         return (
             "You are JEEVES, Tony Stark's AI assistant. "
@@ -131,6 +160,11 @@ def _load_runtime_imports() -> dict:
             add_monitor, remove_monitor, list_monitors,
             check_all as monitor_check_all,
         )
+        from actions.business_tracker import business_tracker
+        from actions.daily_briefing import daily_briefing
+        from actions.anime_watch import anime_watch
+        from actions.secretary import secretary
+        from actions.meta_ai import meta_ai
 
         from clap_listen import ClapListener
 
@@ -163,6 +197,11 @@ def _load_runtime_imports() -> dict:
             "remove_monitor": remove_monitor,
             "list_monitors": list_monitors,
             "monitor_check_all": monitor_check_all,
+            "business_tracker": business_tracker,
+            "daily_briefing": daily_briefing,
+            "anime_watch": anime_watch,
+            "secretary": secretary,
+            "meta_ai": meta_ai,
             # NOTE: run_agentic_task intentionally NOT bundled here — the
             # composio_agent module pulls in the full Composio SDK (~10s /
             # ~100MB cold). It's imported lazily inside _execute_tool only
@@ -227,6 +266,7 @@ class JeevesLive:
         self._sys_monitor = None            # lazy: SystemMonitor on first alert loop
         self._alert_lock = None             # lazy: asyncio.Lock to serialize alerts
         self._briefing_done  = False        # morning briefing runs once per launch
+        self._seen_tool_tips: set[str] = set()  # first-use tool tips (like the CLI)
         self.ui.on_text_command = self._on_text_command
         self.ui.on_clap_toggle  = self._on_clap_toggle
         self.ui.on_remote_clicked = self._make_remote_key
@@ -239,6 +279,9 @@ class JeevesLive:
     def _on_remote_command(self, text: str):
         if not self._loop:
             return
+        # Mirror dashboard commands into the GUI conversation history (and
+        # back out to the dashboard via on_log) so both sides stay in sync.
+        self.ui.write_log(f"You: {text}")
         asyncio.run_coroutine_threadsafe(self._handle_utterance(text), self._loop)
 
     def _make_remote_key(self):
@@ -250,6 +293,22 @@ class JeevesLive:
         manual = self._dashboard.get_manual_url()
         self.ui.write_log(f"SYS: Remote dashboard key generated — {url} (key: {key})")
         return url, key, f"{url}/auto-login?key={key}", manual
+
+    def _forward_log_to_dashboard(self, text: str, tool: str | None = None) -> None:
+        """Mirror every HUD log line (tool tips included) to the dashboard.
+
+        Called from whatever thread logged the line — push_log_threadsafe
+        schedules the broadcast onto the dashboard's own loop, so this is
+        safe from the Qt thread and executor threads alike. `tool` is set
+        for tool-tip lines so the dashboard can render them clickable.
+        Never raises.
+        """
+        if self._dashboard is None:
+            return
+        try:
+            self._dashboard.push_log_threadsafe(_dashboard_speaker(text), text, tool)
+        except Exception:
+            pass
 
     def _dashboard_extra_status(self) -> dict:
         """Live status for the remote dashboard: monitored topics + last alert.
@@ -313,6 +372,23 @@ class JeevesLive:
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
+    def _maybe_show_tool_tip(self, name: str) -> None:
+        """Log a one-line usage tip the first time a tool is used.
+
+        Mirrors the CLI's behavior: each tool's tip prints once per session,
+        then stays quiet so long pipelines don't spam the HUD log. Tips come
+        from the shared config/tool_tips.py tutorials, so GUI and CLI stay
+        in sync. write_log is thread-safe (emits a Qt signal).
+        """
+        if name in self._seen_tool_tips:
+            return
+        self._seen_tool_tips.add(name)
+        tip = get_tool_tip(name)
+        if tip:
+            # Rendered as a clickable link in the HUD log — clicking it
+            # opens the tool's full tutorial in the content panel.
+            self.ui.write_tool_tip(name, f"TIP: {tip}")
+
     def _build_system_prompt(self) -> str:
         from datetime import datetime
 
@@ -370,6 +446,7 @@ class JeevesLive:
     async def _execute_tool(self, name: str, args: dict) -> str:
         args = dict(args or {})
         imports = _load_runtime_imports()
+        self._maybe_show_tool_tip(name)
 
         print(f"[JEEVES] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -457,6 +534,31 @@ class JeevesLive:
                     topics = await asyncio.to_thread(imports["list_monitors"])
                     result = ("Monitoring: " + ", ".join(topics)) if topics \
                              else "No topics are being monitored."
+
+            elif name == "business_tracker":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["business_tracker"](parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "daily_briefing":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["daily_briefing"](parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "anime_watch":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["anime_watch"](parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "secretary":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["secretary"](parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "meta_ai":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["meta_ai"](parameters=args, player=self.ui))
+                result = r or "Done."
 
             elif name == "computer_settings":
                 r = await loop.run_in_executor(None, lambda: imports["computer_settings"](parameters=args, response=None, player=self.ui))
@@ -987,6 +1089,9 @@ class JeevesLive:
             self._dashboard = DashboardServer()
             self._dashboard.set_command_callback(self._on_remote_command)
             self._dashboard.set_status_provider(self._dashboard_extra_status)
+            # Stream every HUD log line (incl. clickable tool tips) to the
+            # dashboard's live log.
+            self.ui.on_log = self._forward_log_to_dashboard
             self._dashboard.set_wake_callback(lambda: self.ui.write_log("SYS: Remote wake received."))
 
             def _on_remote_connected():
@@ -1008,6 +1113,8 @@ class JeevesLive:
                 print("[JEEVES] Ready.")
                 self.ui.set_state("LISTENING")
                 self.ui.write_log("SYS: JEEVES online (local voice pipeline).")
+                _tip_name, _tip_text = random_tip_entry()
+                self.ui.write_tool_tip(_tip_name, f"TIP: {_tip_text}")
 
                 # Morning briefing: background task, speaks greeting + fresh news
                 asyncio.create_task(self._maybe_start_morning_briefing())
@@ -1052,9 +1159,28 @@ def _prewarm_runtime_imports():
     would otherwise stall the "LISTENING" mic stream right after launch.
     Starting it here overlaps with UI construction + setup + TTS warm-up,
     so by the time the pipeline starts the modules are already cached.
+
+    The groq SDK (~3.7s) is also pre-imported here: without it, the very
+    first brain request stalls on the import before the network call even
+    starts, making the first response feel slow. The Whisper STT model
+    (~7s, normally loaded on the FIRST spoken utterance) is pre-loaded too
+    so the first request is as fast as every subsequent one. _get_model is
+    lock-guarded, so a prewarm racing the first live transcription is safe.
     """
     try:
         _load_runtime_imports()
+        try:
+            # Import the exact symbol the request path uses (_groq_client
+            # does `from groq import Groq`), so the whole SDK — not just the
+            # base package — is cached before the first request.
+            from groq import Groq  # noqa: F401
+        except Exception:
+            pass  # SDK absent — or_client handles it lazily at request time
+        try:
+            from stt_engine import _get_model
+            _get_model()  # pre-load Whisper so the first utterance isn't slow
+        except Exception:
+            pass  # STT unavailable — voice input degrades gracefully later
         # ASCII-only print: background threads can hit the cp1252 console
         # encoding on Windows and crash on emoji.
         print("[JEEVES] Runtime modules pre-warmed")
@@ -1071,7 +1197,11 @@ def main():
     # overlaps with wait_for_api_key() + TTS warm-up, so by the time the
     # voice pipeline starts, its modules are already cached and the mic
     # opens instantly.
-    ui = JeevesUI("face.png")
+    # Resolve the HUD face relative to the project dir, not the CWD, so
+    # launching from anywhere still finds it. If the file is absent,
+    # HudCanvas._load_face already degrades gracefully (face hidden).
+    face_path = str(BASE_DIR / "face.png")
+    ui = JeevesUI(face_path)
     threading.Thread(target=_prewarm_runtime_imports, daemon=True).start()
 
     def runner():

@@ -66,6 +66,108 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "manage_monitor",
+        "description": (
+            "Manages background news monitoring: start watching a topic "
+            "(a keyword or subject), stop watching one, or list what is "
+            "currently being monitored. Use when the user asks to monitor, "
+            "track, or keep an eye on something in the background. "
+            "Topics are checked once a day and alerts are surfaced."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "add | remove | list"},
+                "topic":  {"type": "STRING", "description": "Topic to add or remove (e.g. 'OpenAI announcements', 'PS5 restock')"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "business_tracker",
+        "description": (
+            "Tracks income and expenses locally (no external accounts). "
+            "Use when the user says 'track $X income/expense for Y', asks "
+            "about their balance, monthly money report, or wants to import "
+            "a CSV of transactions. Actions: add, remove, list, balance, "
+            "monthly, import, clear."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "add | remove | list | balance | monthly | import | clear (default: balance)"},
+                "kind":   {"type": "STRING", "description": "income | expense (for add/import)"},
+                "amount": {"type": "NUMBER", "description": "Positive amount in dollars (for add)"},
+                "label":  {"type": "STRING", "description": "Short description, e.g. 'freelance project' (for add)"},
+                "date":   {"type": "STRING", "description": "YYYY-MM-DD (optional, defaults to today)"},
+                "index":  {"type": "NUMBER", "description": "1-based index shown by `list`, newest first (for remove)"},
+                "month":  {"type": "STRING", "description": "YYYY-MM for the monthly report (optional)"},
+                "text":   {"type": "STRING", "description": "CSV lines: date,type,amount,label (for import)"},
+                "confirm": {"type": "STRING", "description": "'yes' to confirm clear"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "daily_briefing",
+        "description": (
+            "One-command morning/overall briefing: date, finance balance "
+            "(if tracked), background monitored topics, and upcoming "
+            "reminders. Local and instant. Optionally include_email=True "
+            "to also summarize unread email via the Composio agent."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "include_email": {"type": "BOOLEAN", "description": "Also summarize unread email (slower, uses tokens). Default false."}
+            },
+            "required": []
+        }
+    },
+    {
+        "name": "anime_watch",
+        "description": (
+            "Anime monitor and recommender (AniList, no API key). Use for "
+            "new anime airing this season (action='new'), most-trending "
+            "anime (action='trending'), or details + Netflix availability "
+            "for a specific title (action='check' title='...'). Every entry "
+            "reports episodes, season, genre, and fully-released/ongoing "
+            "status; Netflix titles are flagged and preferred but non-Netflix "
+            "ones are never ignored."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "new | trending | check (default: new)"},
+                "title":  {"type": "STRING", "description": "Anime title to look up (for action='check')"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "secretary",
+        "description": (
+            "Secretary mode — Jeeves holds conversations on the user's "
+            "behalf when they're busy. Actions: on/off/status (toggle the "
+            "mode), link (open the persistent WhatsApp window to scan the QR "
+            "once — the session is saved and reused forever), link close, "
+            "handle (process one incoming message: sender + message), inbox "
+            "(escalated items needing the user's answer), reply (send a "
+            "personal reply as the user), inbox_clear. Routine messages get "
+            "an automatic polite reply; urgent/money/decision messages are "
+            "escalated to the user instead of auto-answered."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":  {"type": "STRING", "description": "on | off | status | link | link close | handle | inbox | reply | inbox_clear (default: status)"},
+                "sender":  {"type": "STRING", "description": "Who the message is from (for handle/reply)"},
+                "message": {"type": "STRING", "description": "The incoming message (for handle) or the reply text (for reply)"}
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "weather_report",
         "description": "Gives the weather report to user",
         "parameters": {
@@ -84,7 +186,8 @@ TOOL_DECLARATIONS = [
             "properties": {
                 "receiver":     {"type": "STRING", "description": "Recipient contact name"},
                 "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
+                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."},
+                "method":       {"type": "STRING", "description": "whatsapp only: 'auto' (default — background bridge first, foreground flow as fallback) | 'bridge' | 'desktop' | 'shortcut' (keyboard) | 'vision' (screen locator)"}
             },
             "required": ["receiver", "message_text", "platform"]
         }
@@ -467,6 +570,58 @@ TOOL_DECLARATIONS = [
             "required": ["category", "key", "value"]
         }
     },
+    {
+        "name": "meta_ai",
+        "description": (
+            "Asks Meta AI (the AI assistant built into WhatsApp) a question "
+            "and returns its answer. Use when the user wants an AI's take, "
+            "a second opinion, research help, a brainstorm, or an image "
+            "('imagine ...'), and also as an automatic fallback when the "
+            "main brain is unreachable."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "question": {"type": "STRING", "description": "The question to ask Meta AI"}
+            },
+            "required": ["question"]
+        }
+    },
+    {
+        "name": "phone_control",
+        "description": (
+            "Controls the user's Android phone through ADB over Wi-Fi: "
+            "status/connect (one-time USB setup, then cable-free), screen "
+            "(screenshot with optional vision analysis, tap, swipe, type, "
+            "key events), apps (list, launch, stop), files (browse, pull, "
+            "push), info (model, battery, storage) and safe shell commands. "
+            "Destructive actions are blocked."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "status|connect|info|screenshot|tap|swipe|text|key|apps|launch|stop|files|pull|push|shell"},
+                "x": {"type": "INTEGER", "description": "tap x (pixels)"},
+                "y": {"type": "INTEGER", "description": "tap y (pixels)"},
+                "x1": {"type": "INTEGER", "description": "swipe start x"},
+                "y1": {"type": "INTEGER", "description": "swipe start y"},
+                "x2": {"type": "INTEGER", "description": "swipe end x"},
+                "y2": {"type": "INTEGER", "description": "swipe end y"},
+                "duration_ms": {"type": "INTEGER", "description": "swipe duration (default 300)"},
+                "text": {"type": "STRING", "description": "text to type"},
+                "key": {"type": "STRING", "description": "home|back|recents|power|volume_up|enter|menu|..."},
+                "pkg": {"type": "STRING", "description": "Android package name"},
+                "query": {"type": "STRING", "description": "filter for apps"},
+                "path": {"type": "STRING", "description": "directory to list (default /sdcard)"},
+                "remote": {"type": "STRING", "description": "path on the phone"},
+                "local": {"type": "STRING", "description": "path on the PC"},
+                "cmd": {"type": "STRING", "description": "safe shell command"},
+                "analyze": {"type": "BOOLEAN", "description": "screenshot: run vision analysis"},
+                "port": {"type": "INTEGER", "description": "wireless adb port (default 5555)"}
+            },
+            "required": ["action"]
+        }
+    },
 ]
 
 # ── Compact LLM rendering ──────────────────────────────────────────────────
@@ -512,6 +667,11 @@ TOOL_REGISTRY = [
     {"name": "open_app",         "description": "Opens any application on the computer.",                                                  "usage": "open_app app_name='WhatsApp'"},
     {"name": "web_search",       "description": "Multi-mode web search (search, news, research, price, compare).",                        "usage": "web_search mode='news' query='latest AI news'"},
     {"name": "system_status",    "description": "Reports live system health: CPU, RAM, GPU, temperature, uptime.",                    "usage": "system_status"},
+    {"name": "manage_monitor",   "description": "Starts/stops background news monitoring of a topic.",                                "usage": "manage_monitor action='add' topic='OpenAI news'"},
+    {"name": "business_tracker", "description": "Tracks income/expenses locally; balance and monthly reports.",                       "usage": "business_tracker action='add' kind='income' amount=50 label='freelance'"},
+    {"name": "daily_briefing",   "description": "One-command briefing: finances, monitors, reminders (+optional email).",            "usage": "daily_briefing"},
+    {"name": "anime_watch",      "description": "New/trending anime with episodes, season, genre, status + Netflix flag.",         "usage": "anime_watch action='new'"},
+    {"name": "secretary",        "description": "Secretary mode: holds conversations for you; escalates urgent ones.",            "usage": "secretary action='handle' sender='Mom' message='dinner at 7?'"},
     {"name": "weather_report",   "description": "Gets the weather forecast for a city.",                                                  "usage": "weather_report city='London'"},
     {"name": "send_message",     "description": "Sends a message via WhatsApp, Telegram, etc.",                                           "usage": "send_message receiver='John' message_text='Hi' platform='WhatsApp'"},
     {"name": "reminder",         "description": "Sets a timed reminder.",                                                                 "usage": "reminder date='2025-12-25' time='09:00' message='Christmas!'"},
@@ -532,4 +692,6 @@ TOOL_REGISTRY = [
     {"name": "composio_action",  "description": "Actions on GitHub, Gmail, Google Calendar.",                                            "usage": "composio_action request='check my emails'"},
     {"name": "shutdown_jeeves",  "description": "Shuts down the assistant completely.",                                                   "usage": "shutdown_jeeves"},
     {"name": "save_memory",      "description": "Saves personal facts about you (name, preferences, projects) to long-term memory.",     "usage": "save_memory category='identity' key='name' value='John'"},
+    {"name": "meta_ai",          "description": "Asks Meta AI (the AI inside WhatsApp) a question and returns its answer.",            "usage": "meta_ai question='what is the capital of Kenya?'"},
+    {"name": "phone_control",    "description": "Controls your Android phone over Wi-Fi via ADB (screen, apps, files, info).",                      "usage": "phone_control action='screenshot' analyze=true"},
 ]

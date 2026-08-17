@@ -2,7 +2,7 @@
 BackgroundMonitor — user-configured topic watching.
 
 Checks DDG news once per day per topic; alerts JEEVES when a new headline
-appears. No crypto, no finance, no uninvited tracking.
+appears.
 
 NOTE: prints are ASCII-only because this module runs inside background
 threads where Windows' cp1252 console encoding would crash on emoji.
@@ -12,37 +12,6 @@ import json
 import re
 from datetime import datetime
 from pathlib import Path
-
-
-# ── Blocked categories (never monitor regardless of what user says) ───────────
-
-# Latin-script terms get word-boundary matching so legitimate topics like
-# "cryptography" or "tokenization" are not silently blocked.
-_BLOCKED_WORDS = {
-    "bitcoin", "ethereum", "dogecoin", "solana", "binance",
-    "nft", "blockchain", "defi", "altcoin", "memecoin", "coin", "token",
-    "crypto", "kripto", "cripto", "krypto", "cryptocurrency",
-}
-
-# CJK/Cyrillic terms stay as substring matches — those scripts don't
-# tokenize on whitespace the way \b expects, and the original intent was
-# "these strings, wherever they appear, mean crypto".
-_BLOCKED_SUBSTRINGS = {
-    "\u043a\u0440\u0438\u043f\u0442\u043e",  # крипто
-    "\u4eee\u60f3\u901a\u8ca8",              # 仮想通貨
-    "\u6697\u53f7\u8cc7\u7522",              # 暗号資産
-}
-
-_BLOCKED_WORD_PATTERN = re.compile(
-    r"\b(?:" + "|".join(re.escape(w) for w in _BLOCKED_WORDS) + r")\b",
-    re.IGNORECASE,
-)
-
-def _is_blocked(topic: str) -> bool:
-    t = topic.lower()
-    if _BLOCKED_WORD_PATTERN.search(t):
-        return True
-    return any(sub in t for sub in _BLOCKED_SUBSTRINGS)
 
 
 # ── Slug / hash helpers ───────────────────────────────────────────────────────
@@ -82,8 +51,6 @@ def add_monitor(topic: str) -> str:
     topic = topic.strip()
     if not topic:
         return "Please specify a topic to monitor."
-    if _is_blocked(topic):
-        return "I don't monitor crypto or financial topics."
     monitors = _load()
     slug = _slug(topic)
     if slug in monitors:
@@ -125,7 +92,13 @@ def check_all() -> list[str]:
     """
     Run all pending topic checks (once per day per topic).
     Returns a list of [MONITOR_ALERT] strings — empty if nothing new.
+
+    Each topic is network-bound (a DDG news call), so pending topics run
+    in a small thread pool instead of serially — several monitored topics
+    finish in roughly the time of one. Workers only read the shared
+    monitors dict; updates are merged back on the caller thread.
     """
+    from concurrent.futures import ThreadPoolExecutor
     from actions.web_search import _ddg_news
 
     monitors = _load()
@@ -133,47 +106,53 @@ def check_all() -> list[str]:
         return []
 
     today   = datetime.now().strftime("%Y-%m-%d")
-    alerts  = []
-    changed = False
+    pending = {slug: data for slug, data in monitors.items()
+               if data.get("last_check") != today}
+    if not pending:
+        return []                        # everything checked today already
 
-    for slug, data in monitors.items():
-        if data.get("last_check") == today:
-            continue                     # already checked today
-
-        topic = data.get("topic", slug)
+    def _check(slug: str, data: dict) -> tuple[str, dict, str | None]:
+        """Check one topic; returns (slug, updated_data, alert_or_None)."""
+        topic   = data.get("topic", slug)
+        updated = dict(data)
         try:
             results = _ddg_news(topic, max_results=5)
+            updated["last_check"] = today
             if not results:
-                monitors[slug]["last_check"] = today
-                changed = True
-                continue
+                return slug, updated, None
 
             top   = results[0]
             title = top.get("title", "").strip()
             if not title:
-                continue
+                return slug, updated, None
 
             h = _title_hash(title)
-            monitors[slug]["last_check"] = today
-            changed = True
-
-            if h == data.get("last_hash"):
-                continue                 # same headline as last check — no alert
-
-            monitors[slug]["last_hash"] = h
-
-            snippet = top.get("snippet", "")[:150]
-            source  = top.get("source", "")
-            parts   = [f"[MONITOR_ALERT] {topic}", f"Headline: {title}"]
-            if snippet:
-                parts.append(snippet)
-            if source:
-                parts.append(f"Source: {source}")
-            alerts.append("\n".join(parts))
-            print(f"[Monitor] New headline for '{topic}': {title[:60]}")
-
+            if h != data.get("last_hash"):      # new headline since last check
+                updated["last_hash"] = h
+                snippet = top.get("snippet", "")[:150]
+                source  = top.get("source", "")
+                parts   = [f"[MONITOR_ALERT] {topic}", f"Headline: {title}"]
+                if snippet:
+                    parts.append(snippet)
+                if source:
+                    parts.append(f"Source: {source}")
+                print(f"[Monitor] New headline for '{topic}': {title[:60]}")
+                return slug, updated, "\n".join(parts)
+            return slug, updated, None
         except Exception as e:
             print(f"[Monitor] Check failed for '{topic}': {e}")
+            return slug, data, None
+
+    alerts: list[str] = []
+    changed = False
+    with ThreadPoolExecutor(max_workers=min(4, len(pending))) as pool:
+        for slug, updated, alert in pool.map(
+            lambda item: _check(item[0], item[1]), list(pending.items())
+        ):
+            monitors[slug] = updated
+            changed = changed or updated.get("last_check") == today
+            if alert:
+                alerts.append(alert)
 
     if changed:
         _save(monitors)

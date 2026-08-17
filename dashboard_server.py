@@ -70,9 +70,34 @@ class DashboardServer:
         self._wake_callback = None
         self._connect_callback = None
         self._status_provider = None   # optional fn() -> dict merged into /api/status
+        self._loop = None              # asyncio loop captured in serve() — for thread-safe pushes
         self._ready = False
         self._web_pin = _load_web_pin()
         self.app = None  # built lazily by _build_app() on first serve()
+        self._tip = ""            # cached rotating tip for the dashboard Tip pill
+        self._tip_tool = ""       # tool the current tip belongs to (for tutorials)
+        self._tip_ts = 0.0
+        self._tip_interval = 60.0  # rotate at most once a minute, not per 10s poll
+
+    def _current_tip(self) -> str:
+        """Rotating usage tip for the dashboard's Tip pill (cached ~60s).
+
+        Same tip source as the CLI and HUD (config/tool_tips), so all three
+        surfaces stay in sync. Lazy import keeps startup light; never raises.
+        """
+        now = time.time()
+        if not self._tip or now - self._tip_ts >= self._tip_interval:
+            try:
+                from config.tool_tips import random_tip_entry
+                self._tip_tool, self._tip = random_tip_entry()
+            except Exception:
+                self._tip_tool = ""
+                self._tip = (
+                    "Type a command below — e.g. 'open notepad', "
+                    "'search python 3.13', 'play despacito'."
+                )
+            self._tip_ts = now
+        return self._tip
 
     def new_key(self, expiry_secs: int = 600) -> str:
         now = time.time()
@@ -116,10 +141,30 @@ class DashboardServer:
                 dead.add(ws)
         self._clients -= dead
 
-    def push_log(self, speaker: str, text: str) -> None:
+    def push_log(self, speaker: str, text: str, tool: str | None = None) -> None:
         if not text:
             return
-        asyncio.create_task(self.broadcast({"type": "log", "speaker": speaker, "text": text}))
+        msg: dict = {"type": "log", "speaker": speaker, "text": text}
+        if tool:
+            msg["tool"] = tool   # lets clients render the line clickable to its tutorial
+        asyncio.create_task(self.broadcast(msg))
+
+    def push_log_threadsafe(self, speaker: str, text: str, tool: str | None = None) -> None:
+        """push_log from any thread (UI thread, executor threads).
+
+        push_log needs a running asyncio loop in the calling thread; GUI log
+        lines arrive from the Qt thread, so schedule the broadcast onto the
+        dashboard's own loop instead. No-op until serve() is running.
+        """
+        if not text:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            loop.call_soon_threadsafe(self.push_log, speaker, text, tool)
+        except RuntimeError:
+            pass  # loop shutting down
 
     def push_status(self, state: str) -> None:
         asyncio.create_task(self.broadcast({"type": "status", "state": state}))
@@ -175,11 +220,24 @@ button{border:0;border-radius:12px;padding:12px 14px;background:linear-gradient(
 .stack{padding:12px;display:grid;gap:10px}.pill{padding:12px;border-radius:14px;background:#09131a;border:1px solid rgba(0,212,255,.09)}
 .alert-body{font-size:12px;color:#9fc4d5;margin-top:4px;line-height:1.5;word-break:break-word}
 .kv{display:flex;justify-content:space-between;gap:10px;font-size:13px;padding:3px 0;color:#aec9d6}
+#clear-log{margin:0;padding:4px 10px;font-size:11px;font-weight:700;width:auto;border:1px solid rgba(0,212,255,.25);background:rgba(0,20,28,.6);color:#9fc4d5;border-radius:6px;cursor:pointer}
+#clear-log:hover{color:#ff7b86;border-color:#ff7b86}
+#pause-chip{font-size:11px;color:#ffcc00}
+#tip{cursor:pointer;color:#00d4ff;text-align:right;text-decoration:underline dotted;overflow-wrap:anywhere}
+#tip:hover{color:#6ee7ff}
+.tip-line{cursor:pointer;text-decoration:underline dotted}
+.tip-line:hover{color:#6ee7ff}
+.modal{position:fixed;inset:0;background:rgba(2,6,10,.72);display:none;align-items:center;justify-content:center;z-index:50}
+.modal-card{width:min(560px,92vw);max-height:82vh;display:flex;flex-direction:column;background:#081420;border:1px solid rgba(0,212,255,.28);border-radius:16px;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.55)}
+.modal-card .head{display:flex;justify-content:space-between;align-items:center}
+.modal-body{flex:1;overflow:auto;padding:14px;font-size:13px;line-height:1.65;white-space:pre-wrap;word-break:break-word;color:#cfe9f5}
+#tut-close{margin:10px 12px;padding:9px 14px;width:auto;align-self:flex-end}
 @media (max-width: 900px){.wrap{grid-template-columns:1fr;}.card:first-child{min-height:52vh}}
 </style></head><body>
 <div class="top"><div><div class="brand">JEEVES REMOTE</div><div class="small" id="ip">Connecting…</div></div><div class="small" id="state">IDLE</div></div>
-<div class="wrap"><div class="card"><div class="head">LIVE LOG</div><div id="log"></div><div class="composer"><textarea id="cmd" placeholder="Type a remote command..."></textarea><button id="send">Send</button></div></div>
-<div class="card"><div class="head">STATUS</div><div class="stack"><div class="pill"><div class="kv"><span>Provider</span><span id="provider">unknown</span></div><div class="kv"><span>Model</span><span id="model">unknown</span></div><div class="kv"><span>Dashboard</span><span id="url">unknown</span></div></div><div class="pill"><div class="kv"><span>Monitoring</span><span id="monitors">none</span></div><div class="kv"><span>Last alert</span><span id="alert-time">—</span></div><div id="last-alert" class="alert-body">none</div></div><div class="pill"><div class="kv"><span>Tip</span><span>Use the desktop app to generate a fresh key</span></div></div></div></div></div>
+<div class="wrap"><div class="card"><div class="head" style="display:flex;align-items:center;gap:10px"><span style="flex:1">LIVE LOG</span><span class="small" id="pause-chip" style="display:none">⏸ paused</span><button id="clear-log">Clear</button></div><div id="log"></div><div class="composer"><textarea id="cmd" placeholder="Type a remote command..."></textarea><button id="send">Send</button></div></div>
+<div class="card"><div class="head">STATUS</div><div class="stack"><div class="pill"><div class="kv"><span>Provider</span><span id="provider">unknown</span></div><div class="kv"><span>Model</span><span id="model">unknown</span></div><div class="kv"><span>Dashboard</span><span id="url">unknown</span></div></div><div class="pill"><div class="kv"><span>Monitoring</span><span id="monitors">none</span></div><div class="kv"><span>Last alert</span><span id="alert-time">—</span></div><div id="last-alert" class="alert-body">none</div></div><div class="pill"><div class="kv"><span>Tip</span><span id="tip" title="Click for the full tutorial">Loading…</span></div></div></div></div></div>
+<div class="modal" id="tut-modal"><div class="modal-card"><div class="head"><span id="tut-title">TOOL TUTORIAL</span><span class="small" style="cursor:pointer" id="tut-x">✕</span></div><div class="modal-body" id="tut-body"></div><button id="tut-close">Close</button></div></div>
 <script>
 const token=sessionStorage.getItem('jeeves_token');
 if(!token) location.href='/login';
@@ -193,12 +251,26 @@ const ip=document.getElementById('ip');
 const monitors=document.getElementById('monitors');
 const lastAlert=document.getElementById('last-alert');
 const alertTime=document.getElementById('alert-time');
+const tip=document.getElementById('tip');
+const tutModal=document.getElementById('tut-modal');
+const tutTitle=document.getElementById('tut-title');
+const tutBody=document.getElementById('tut-body');
+let tipTool='';
+let autoScroll=true;
+const pauseChip=document.getElementById('pause-chip');
 function esc(s){return String(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));}
-function append(cls,who,text){const d=document.createElement('div');d.className='msg '+cls;d.innerHTML='<strong>'+esc(who)+'</strong><br>'+esc(text);log.appendChild(d);log.scrollTop=log.scrollHeight;}
+async function openTut(tool){if(!tool)return;try{const r=await fetch('/api/tutorial?name='+encodeURIComponent(tool),{headers:auth});const j=await r.json();tutTitle.textContent='TOOL TUTORIAL — '+(j.name||tool);tutBody.textContent=(j&&j.tutorial)||("No tutorial for '"+(j.name||tool)+"'.");tutModal.style.display='flex';}catch(_){}}
+function append(cls,who,text,tool){const d=document.createElement('div');d.className='msg '+cls;if(tool){d.innerHTML='<strong>'+esc(who)+'</strong><br><span class="tip-line">'+esc(text)+'</span>';d.querySelector('.tip-line').onclick=()=>openTut(tool);}else{d.innerHTML='<strong>'+esc(who)+'</strong><br>'+esc(text);}log.appendChild(d);if(autoScroll)log.scrollTop=log.scrollHeight;}
+log.addEventListener('scroll',()=>{const nearBottom=log.scrollHeight-log.scrollTop-log.clientHeight<40;autoScroll=nearBottom;pauseChip.style.display=autoScroll?'none':'inline';});
 function fmtAlert(a){if(!a)return 'none';const first=(String(a).split('\\n')[0]||'').replace(/^\\[[^\\]]*\\]\\s*/,'').trim();return first.slice(0,140)||'none';}
-async function refresh(){const r=await fetch('/api/status',{headers:auth});const j=await r.json();ip.textContent=j.url||'';provider.textContent=j.provider||'unknown';model.textContent=j.model||'unknown';url.textContent=j.url||'unknown';state.textContent=j.state||'IDLE';monitors.textContent=(j.monitors&&j.monitors.length)?j.monitors.join(', ').slice(0,90):'none';lastAlert.textContent=fmtAlert(j.last_alert);alertTime.textContent=j.last_alert_at?new Date(j.last_alert_at*1000).toLocaleTimeString():'—';}
-function wsConnect(){const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='log') append(m.speaker||'sys',m.speaker||'SYS',m.text||''); if(m.type==='status') state.textContent=m.state||'IDLE'; if(m.type==='sys') append('sys','SYS',m.text||''); if(m.type==='status') state.textContent=m.state||'IDLE';};ws.onclose=()=>setTimeout(wsConnect,1000);}
-document.getElementById('send').onclick=async()=>{const t=document.getElementById('cmd');const txt=t.value.trim();if(!txt)return;t.value='';append('user','You',txt);await fetch('/api/command',{method:'POST',headers:auth,body:JSON.stringify({text:txt})});};
+async function refresh(){const r=await fetch('/api/status',{headers:auth});const j=await r.json();ip.textContent=j.url||'';provider.textContent=j.provider||'unknown';model.textContent=j.model||'unknown';url.textContent=j.url||'unknown';state.textContent=j.state||'IDLE';monitors.textContent=(j.monitors&&j.monitors.length)?j.monitors.join(', ').slice(0,90):'none';lastAlert.textContent=fmtAlert(j.last_alert);alertTime.textContent=j.last_alert_at?new Date(j.last_alert_at*1000).toLocaleTimeString():'—';tip.textContent=j.tip||'Use the desktop app to generate a fresh key';tipTool=j.tip_tool||'';}
+function wsConnect(){const proto=location.protocol==='https:'?'wss':'ws';const ws=new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`);ws.onmessage=e=>{const m=JSON.parse(e.data);if(m.type==='clear'){log.innerHTML='';autoScroll=true;pauseChip.style.display='none';}if(m.type==='log') append(m.speaker||'sys',m.speaker||'SYS',m.text||'',m.tool||''); if(m.type==='status') state.textContent=m.state||'IDLE'; if(m.type==='sys') append('sys','SYS',m.text||''); if(m.type==='status') state.textContent=m.state||'IDLE';};ws.onclose=()=>setTimeout(wsConnect,1000);}
+document.getElementById('clear-log').onclick=async()=>{try{await fetch('/api/clear-log',{method:'POST',headers:auth});}catch(_){}};
+function closeTut(){tutModal.style.display='none';}
+tip.onclick=()=>openTut(tipTool);
+document.getElementById('tut-close').onclick=closeTut;
+document.getElementById('tut-x').onclick=closeTut;
+document.getElementById('send').onclick=async()=>{const t=document.getElementById('cmd');const txt=t.value.trim();if(!txt)return;t.value='';await fetch('/api/command',{method:'POST',headers:auth,body:JSON.stringify({text:txt})});};
 document.getElementById('cmd').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();document.getElementById('send').click();}});
 refresh();wsConnect();setInterval(refresh,10000);
 </script></body></html>"""
@@ -301,6 +373,8 @@ refresh();wsConnect();setInterval(refresh,10000);
             payload = {
                 "ok": True, "url": self.get_url(), "state": "online",
                 "provider": "jeeves", "model": "jeeves",
+                "tip": self._current_tip(),
+                "tip_tool": self._tip_tool,
             }
             if self._status_provider is not None:
                 try:
@@ -310,6 +384,24 @@ refresh();wsConnect();setInterval(refresh,10000);
                 except Exception:
                     pass   # live status must never break the dashboard
             return JSONResponse(payload)
+
+        @app.get("/api/tutorial")
+        async def tutorial(req: Request, name: str = ""):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            from config.tool_tips import tool_tutorial
+            return JSONResponse({"ok": True, "name": name, "tutorial": tool_tutorial(name)})
+
+        @app.post("/api/clear-log")
+        async def clear_log(req: Request):
+            """Clear the dashboard's live log for every connected client."""
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            # Broadcast first, then wipe: broadcast() appends to _history,
+            # and a reconnect should replay a clean slate, not the clear msg.
+            await self.broadcast({"type": "clear"})
+            self._history.clear()
+            return JSONResponse({"ok": True})
 
         @app.post("/api/command")
         async def command(req: Request):
@@ -360,6 +452,7 @@ refresh();wsConnect();setInterval(refresh,10000);
         return app
 
     async def serve(self) -> None:
+        self._loop = asyncio.get_running_loop()   # for push_log_threadsafe
         if self.app is None:
             self.app = self._build_app()
         if self.app is None:
