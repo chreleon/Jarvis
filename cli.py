@@ -98,6 +98,46 @@ MAX_MSG_CHARS        = 2500  # per-message cap inside the brain context
 MAX_HISTORY_CHARS    = 4000  # total cap for the trimmed conversation
 TOOL_RESULT_CHARS    = 1200  # tool results kept in history (rest is dropped)
 
+# ── Agentic loop settings (inspired by Claude Code) ──────────────────────
+# Claude Code chains multiple tool calls before responding. We replicate
+# this so the LLM can call tools in sequence (e.g. search → read file →
+# edit) without requiring the user to prompt between each step.
+AGENTIC_MAX_STEPS    = 8     # max tool calls per user turn before forced reply
+AGENTIC_STEP_TIMEOUT = 60    # seconds per tool call in the loop
+_AUTO_APPROVE        = False  # session-wide toggle (via /approve command)
+
+# ── Permission system (Claude Code-style safety gates) ────────────────────
+# Dangerous operations require user confirmation before execution.
+# Patterns matched against tool name + args to decide risk level.
+_DANGEROUS_TOOL_PATTERNS: list[tuple[str, list[str]]] = [
+    # (tool_name, [dangerous_action_values])
+    ("cmd_control",     []),  # all cmd_control calls need approval
+    ("file_controller", ["delete"]),
+    ("computer_settings", ["restart", "shutdown", "sleep", "hibernate"]),
+    ("game_updater",    ["install"]),
+    ("phone_control",   ["shell", "stop"]),
+]
+
+# Tools that are ALWAYS safe (never ask permission)
+_ALWAYS_SAFE_TOOLS: set[str] = {
+    "open_app", "web_search", "system_status", "manage_monitor",
+    "weather_report", "reminder", "youtube_video", "screen_process",
+    "browser_control", "file_controller",  # except delete (handled above)
+    "computer_control", "computer_settings",  # except restart/shutdown
+    "desktop_control", "code_helper",
+    "daily_briefing", "anime_watch",
+    "send_message", "save_memory", "meta_ai", "flight_finder",
+    "file_processor", "phone_control",  # most actions safe
+    "secretary",  # except shell/stop (handled above)
+}
+
+# ── Cost tracking (approximate, based on Groq free-tier pricing) ────────
+_INPUT_COST_PER_1K  = 0.0    # Groq free tier: $0 input
+_OUTPUT_COST_PER_1K = 0.0    # Groq free tier: $0 output
+_estimated_tokens_in: int = 0
+_estimated_tokens_out: int = 0
+_total_tool_calls: int = 0
+
 # ── Console Player (adapter for action modules) ─────────────────────────────
 
 class ConsolePlayer:
@@ -394,7 +434,24 @@ def _build_system_prompt() -> str:
         "\n[TOOLS]\nYou have tools available. To call one, respond with "
         'ONLY a JSON object of the form {"tool_call": {"name": "<tool_name>", "args": {...}}}. '
         "To just speak to the user, respond with plain text (no JSON). "
+        "You may chain multiple tool calls in sequence before responding. "
         "Available tools:\n" + compact_tool_declarations()
+    )
+
+    # Vision-agent discipline: classify the task type and apply the right
+    # approach (from the vision agent protocol). This helps the LLM choose
+    # the right tools and respond with appropriate depth.
+    parts.append(
+        "\n[DISCIPLINE]\n"
+        "Before acting, classify the task:\n"
+        "  DEBUG — something broken: diagnose → reproduce → fix → verify\n"
+        "  BUILD — new feature: design → implement → test\n"
+        "  INFO — research/search: find → present clearly\n"
+        "  CONTROL — system/phone action: call the right tool directly\n"
+        "Apply the matching discipline. For DEBUG: read the actual files, "
+        "identify root cause, propose minimal fix. For BUILD: confirm scope "
+        "first if ambiguous. For INFO: search then summarize. For CONTROL: "
+        "use the most direct tool, skip the LLM when shortcuts exist."
     )
 
     return "\n".join(parts)
@@ -405,6 +462,77 @@ def _build_system_prompt() -> str:
 # Tools whose one-liner tip was already shown this session — each tool's
 # usage hint prints once per session, then stays quiet so long pipelines
 # don't spam.
+# ── Permission system ────────────────────────────────────────────────────
+
+def _needs_permission(name: str, args: dict) -> bool:
+    """Return True if this tool call requires user approval.
+
+    Claude Code asks before running dangerous operations. We replicate
+    that safety gate: any tool matching _DANGEROUS_TOOL_PATTERNS needs
+    a 'y' from the user before execution. Read-only / safe tools skip
+    the prompt entirely.
+    """
+    name = (name or "").strip()
+    # Check always-safe list first (fast path)
+    if name in _ALWAYS_SAFE_TOOLS:
+        # Even safe tools can have dangerous sub-actions
+        for pattern_name, dangerous_actions in _DANGEROUS_TOOL_PATTERNS:
+            if name == pattern_name and dangerous_actions:
+                action = str(args.get("action", "")).lower().strip()
+                if action in dangerous_actions:
+                    return True
+        return False
+    # Not in the safe list → needs permission (unknown tools are dangerous)
+    return True
+
+
+def _ask_permission(name: str, args: dict) -> bool:
+    """Ask the user to approve a dangerous tool call.
+
+    Returns True if approved, False if denied. In non-interactive mode
+    (daemon, -c), auto-approves to avoid blocking. Session-wide auto-approve
+    can be toggled with the /approve command.
+    """
+    if _AUTO_APPROVE or not sys.stdout.isatty():
+        return True  # auto-approve or non-interactive
+
+    # Build a human-readable description of what will happen
+    desc = _tool_description(name, args)
+    print(f"\n{Style.BRIGHT_YELLOW}⚠️  Permission required:{Style.RESET} {Style.BOLD}{desc}{Style.RESET}")
+    try:
+        answer = input(f"{Style.DIM}Allow? [y/N]: {Style.RESET}").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print()
+        return False
+    return answer in ("y", "yes", "ok")
+
+
+def _tool_description(name: str, args: dict) -> str:
+    """Build a short human-readable description of a tool call."""
+    action = str(args.get("action", "")).strip()
+    task = str(args.get("task", "")).strip()
+    path = str(args.get("path", "")).strip()
+    cmd = str(args.get("cmd", "")).strip()
+    text = str(args.get("text", "")).strip()
+    pkg = str(args.get("pkg", "")).strip()
+
+    if name == "cmd_control":
+        return f"Run system command: {task or text or '(unspecified)'}"
+    if name == "file_controller" and action == "delete":
+        return f"Delete file: {path}"
+    if name == "computer_settings":
+        return f"Computer setting: {action} {args.get('value', '')}"
+    if name == "game_updater" and action == "install":
+        return f"Install game: {args.get('game_name', 'unknown')}"
+    if name == "phone_control":
+        if action == "shell":
+            return f"Phone shell: {cmd}"
+        if action == "stop":
+            return f"Force-stop app: {pkg}"
+        return f"Phone: {action}"
+    return f"{name}({action or task or path or cmd or text or '...'})"
+
+
 _SEEN_TOOL_TIPS: set[str] = set()
 
 
@@ -427,6 +555,11 @@ def _call_tool(name: str, args: dict, player: ConsolePlayer) -> str:
     imports = _load_runtime_imports()
     name = name or ""
     _maybe_show_tool_tip(name)
+
+    # ── Permission gate (Claude Code-style safety) ──
+    if not _DAEMON_MODE and _needs_permission(name, args):
+        if not _ask_permission(name, args):
+            return "❌ Permission denied."
 
     # ── save_memory is handled inline ──
     if name == "save_memory":
@@ -793,16 +926,57 @@ def _try_shortcut(text: str, player: ConsolePlayer) -> str | None:
     if m:
         sub = m.group(1).strip()
         low = sub.lower()
+        if low.startswith("devices"):
+            return _run_shortcut("phone_control",
+                                 {"action": "devices"}, player)
         if low.startswith(("status", "state", "info", "device")):
             return _run_shortcut("phone_control",
                                  {"action": "status"}, player)
-        if low.startswith(("connect", "wireless", "wifi")):
+        if low.startswith(("connect", "wireless")):
             return _run_shortcut("phone_control",
                                  {"action": "connect"}, player)
-        if low.startswith(("screenshot", "screen", "shot")):
+        if low.startswith(("screenshot", "shot")):
             return _run_shortcut("phone_control",
                                  {"action": "screenshot", "analyze": True},
                                  player)
+        if low.startswith("screen"):
+            # live mirror (Phantom Droid-style remote view) — 'phone
+            # screenshot' above stays the static capture + vision.
+            return _run_shortcut("phone_control",
+                                 {"action": "screen"}, player)
+        if low.startswith("logcat"):
+            parts = sub.split(maxsplit=1)
+            args = {"action": "logcat"}
+            if len(parts) > 1:
+                tail = parts[1].split()
+                try:
+                    args["lines"] = int(tail[0])
+                    if len(tail) > 1:
+                        args["query"] = " ".join(tail[1:])
+                except (TypeError, ValueError):
+                    args["query"] = parts[1].strip()
+            return _run_shortcut("phone_control", args, player)
+        if low.startswith("wifi"):
+            return _run_shortcut("phone_control",
+                                 {"action": "wifi"}, player)
+        if low.startswith("network"):
+            return _run_shortcut("phone_control",
+                                 {"action": "network"}, player)
+        if low.startswith("report"):
+            return _run_shortcut("phone_control",
+                                 {"action": "report"}, player)
+        if low.startswith("top"):
+            parts = sub.split(maxsplit=1)
+            args = {"action": "top"}
+            if len(parts) > 1:
+                try:
+                    args["limit"] = int(parts[1])
+                except (TypeError, ValueError):
+                    pass
+            return _run_shortcut("phone_control", args, player)
+        if low.startswith("storage"):
+            return _run_shortcut("phone_control",
+                                 {"action": "storage"}, player)
         if low.startswith(("apps", "applications")):
             parts = sub.split(maxsplit=1)
             q = parts[1].strip() if len(parts) > 1 else ""
@@ -901,6 +1075,55 @@ def _try_shortcut(text: str, player: ConsolePlayer) -> str | None:
     if _has_any(t, ("any messages for me", "check my messages",
                     "any escalations", "check my inbox")):
         return _run_shortcut("secretary", {"action": "inbox"}, player)
+    if _has_any(t, ("morning briefing", "briefing", "good morning",
+                    "what's my day like", "start my day")):
+        return _run_shortcut("secretary", {"action": "briefing"}, player)
+    if _has_any(t, ("any alerts", "proactive alerts", "what needs attention",
+                    "overdue follow-ups", "stale conversations")):
+        return _run_shortcut("secretary", {"action": "alerts"}, player)
+    if _has_any(t, ("follow-ups", "follow ups", "pending promises",
+                    "what did i promise", "what do i need to follow up")):
+        return _run_shortcut("secretary", {"action": "followups"}, player)
+
+    # ── Calendar shortcuts ──
+    m = re.match(r"^(?:what'?s? on (?:my )?calendar|calendar|my schedule|today'?s? meetings|meetings today)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "calendar"}, player)
+    m = re.match(r"^(?:tomorrow'?s? meetings|meetings tomorrow|calendar tomorrow)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "calendar", "sub": "tomorrow"}, player)
+    m = re.match(r"^(?:this week'?s? meetings|weekly schedule|calendar week)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "calendar", "sub": "week"}, player)
+    m = re.match(r"^(?:next meeting|what'?s? next|upcoming meetings?)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "calendar", "sub": "next"}, player)
+    if _has_any(t, ("am i free", "check availability", "my availability", "free this")):
+        return _run_shortcut("secretary", {"action": "calendar", "sub": "free", "message": orig}, player)
+
+    # ── Email shortcuts ──
+    m = re.match(r"^(?:check (?:my )?email|email inbox|any emails?|my emails?)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "email"}, player)
+    if _has_any(t, ("urgent emails", "important emails", "any urgent email")):
+        return _run_shortcut("secretary", {"action": "email", "sub": "urgent"}, player)
+    if _has_any(t, ("email triage", "sort my email", "4d email", "triage email")):
+        return _run_shortcut("secretary", {"action": "email", "sub": "triage"}, player)
+    m = re.match(r"^(?:draft (?:an? )?reply|reply to email|email reply)\b", orig, re.IGNORECASE)
+    if m:
+        rest = m.end()
+        return _run_shortcut("secretary", {"action": "email", "sub": "draft", "message": orig[rest:].strip() or "latest email"}, player)
+
+    # ── Delegation shortcuts ──
+    m = re.match(r"^(?:delegation|delegate|who handles|routing)\b", orig, re.IGNORECASE)
+    if m:
+        return _run_shortcut("secretary", {"action": "delegate_list"}, player)
+
+    # ── Meeting prep shortcuts ──
+    if _has_any(t, ("meeting prep", "prepare for meeting", "prep meeting", "brief me on")):
+        return _run_shortcut("secretary", {"action": "meeting_prep", "meeting": orig}, player)
+    if _has_any(t, ("auto prep", "next meeting prep", "prep my next")):
+        return _run_shortcut("secretary", {"action": "meeting_prep", "sub": "auto"}, player)
 
     # Feed an incoming message without tool syntax:
     #   "handle from mom: dinner at 7?" / "incoming from mom: ..."
@@ -1005,12 +1228,21 @@ def _process_turn(
     conversation: list[dict],
     brain_client: Any,
 ) -> dict:
-    """Run one full turn: LLM reply → optional tool execution → follow-up.
+    """Run one full turn with agentic multi-step tool loop.
 
-    Returns a dict: {"reply": str, "tool": str | None, "result": str | None}
-    so callers (REPL, daemon) can render or inspect the outcome.
+    Inspired by Claude Code: the LLM can chain multiple tool calls in
+    sequence before giving a final text response. This lets it search
+    → read → edit, or search → analyze → summarize, without the user
+    prompting between each step.
+
+    Returns a dict: {"reply": str, "tool": str | None, "result": str | None,
+                     "steps": int, "tokens_in": int, "tokens_out": int}
     """
+    global _estimated_tokens_in, _estimated_tokens_out, _total_tool_calls
     conversation.append({"role": "user", "content": text})
+    tools_used: list[str] = []
+    last_result: str | None = None
+    step = 0
 
     try:
         system_prompt = _build_system_prompt()
@@ -1021,8 +1253,6 @@ def _process_turn(
     except Exception as e:
         error_msg = f"Brain error: {e}"
         print(f"\n{Style.RED}❌ {error_msg}{Style.RESET}")
-        # Emergency brain: when the configured provider fails, ask Meta AI
-        # (the assistant inside WhatsApp) instead of going silent.
         fallback = _meta_ai_fallback(text)
         if fallback:
             conversation.append({
@@ -1030,60 +1260,89 @@ def _process_turn(
                 "content": f"[Meta AI] {fallback}",
             })
             return {"reply": f"[Meta AI] {fallback}", "tool": None,
-                    "result": None}
-        return {"reply": error_msg, "tool": None, "result": None}
+                    "result": None, "steps": 0}
+        return {"reply": error_msg, "tool": None, "result": None, "steps": 0}
 
-    conversation.append({"role": "assistant", "content": reply})
-    tool_name, tool_args = parse_tool_call(reply)
+    # ── Agentic loop: chain tool calls until the LLM gives a text reply ──
+    while step < AGENTIC_MAX_STEPS:
+        tool_name, tool_args = parse_tool_call(reply)
 
-    if tool_name:
-        # ── Tool call detected ──
-        print(f"\n{Style.MAGENTA}🔧 Calling: {Style.BOLD}{tool_name}{Style.RESET}")
-        if tool_args:
+        if not tool_name:
+            # Plain text reply — loop ends
+            break
+
+        step += 1
+        _total_tool_calls += 1
+        tools_used.append(tool_name)
+
+        # ── Show what's happening (Claude Code-style progress) ──
+        if step == 1:
+            print()  # blank line before first tool
+        desc = _tool_description(tool_name, tool_args or {})
+        print(f"  {Style.MAGENTA}⚡{Style.RESET} {Style.BOLD}{tool_name}{Style.RESET} {Style.DIM}— {desc}{Style.RESET}")
+        if tool_args and len(tool_args) > 1:
             for k, v in tool_args.items():
-                print(f"  {Style.DIM}{k}: {v}{Style.RESET}")
+                if k != "action" and k != "text":
+                    print(f"    {Style.DIM}{k}: {str(v)[:80]}{Style.RESET}")
 
         result = _call_tool(tool_name, tool_args or {}, player)
+        last_result = str(result or "")
+        _estimated_tokens_out += len(last_result) // 4  # rough token estimate
 
-        # __SILENT__ tools act on their own. screen_process now RETURNS its
-        # analysis text, so the follow-up LLM turn is skipped and the caller
-        # (REPL/WhatsApp) renders the raw result directly — narrating it
-        # would just round-trip the vision output through the LLM.
+        # __SILENT__ tools act on their own (screen_process, etc.)
         if result == "__SILENT__" or tool_name == "screen_process":
-            # Replace the raw tool-call assistant message with a cleaner version
             conversation[-1] = {
                 "role": "assistant",
                 "content": f"(ran {tool_name} — output shown above)",
             }
-            return {"reply": "", "tool": tool_name, "result": result}
+            if not _DAEMON_MODE:
+                print(f"  {Style.GREEN}✓{Style.RESET} {Style.DIM}(output displayed above){Style.RESET}")
+            return {"reply": "", "tool": tool_name, "result": result,
+                    "steps": step}
 
-        print(f"\n{Style.GREEN}📋 Result:{Style.RESET} {result[:500]}")
+        # Truncate huge results to keep context manageable
+        result_truncated = last_result[:TOOL_RESULT_CHARS]
+        if len(last_result) > TOOL_RESULT_CHARS:
+            result_truncated += f"\n... ({len(last_result) - TOOL_RESULT_CHARS} chars truncated)"
 
-        # Follow-up: feed result back to the LLM for a natural response.
-        # The result is truncated here so huge tool output can't bloat the
-        # request past the token budget (413).
+        if not _DAEMON_MODE:
+            preview = last_result[:200].replace("\n", " ")
+            print(f"  {Style.GREEN}✓{Style.RESET} {Style.DIM}{preview}{Style.RESET}")
+
+        # Feed result back to the LLM for the next step
+        conversation.append({"role": "assistant", "content": reply})
         conversation.append({
             "role": "user",
-            "content": f"[TOOL RESULT for {tool_name}]: {str(result)[:TOOL_RESULT_CHARS]}\n"
-                       f"Now reply to the user naturally.",
+            "content": f"[TOOL RESULT for {tool_name}]: {result_truncated}\n"
+                       f"Continue working or reply to the user.",
         })
+
         try:
             system_prompt = _build_system_prompt()
-            followup = brain_client.multi_turn(
+            reply = brain_client.multi_turn(
                 [{"role": "system", "content": system_prompt}]
                 + _trim_context(conversation[-HISTORY_WINDOW_TURNS:])
             )
-            conversation.append({"role": "assistant", "content": followup})
-            _maybe_learn(text, followup)
-
-            return {"reply": followup, "tool": tool_name, "result": result}
+            _estimated_tokens_in += len(str(conversation)) // 4
         except Exception as e:
-            return {"reply": str(result)[:200], "tool": tool_name, "result": result}
+            return {"reply": str(last_result)[:200], "tool": tool_name,
+                    "result": last_result, "steps": step}
 
-    else:
-        # ── Plain text reply ──
-        _maybe_learn(text, reply)
-        return {"reply": reply, "tool": None, "result": None}
+    # ── Final response ──
+    conversation.append({"role": "assistant", "content": reply})
+    _estimated_tokens_out += len(reply) // 4
+    _maybe_learn(text, reply)
+
+    primary_tool = tools_used[0] if tools_used else None
+    if tools_used and not _DAEMON_MODE and len(tools_used) > 1:
+        print(f"  {Style.DIM}({len(tools_used)} tool calls: {', '.join(tools_used)}){Style.RESET}")
+
+    return {
+        "reply": reply,
+        "tool": primary_tool,
+        "result": last_result,
+        "steps": step,
+    }
 
 
 def handle_text(
@@ -1091,17 +1350,18 @@ def handle_text(
     player: ConsolePlayer,
     conversation: list[dict],
     brain_client: Any,
-) -> str:
+) -> dict:
     """Send `text` to the LLM reasoning engine, handle tool calls, and
-    return the final response string (compat wrapper for the REPL).
+    return the full turn result dict (reply, tool, result, steps).
 
     Plain-language shortcuts are matched first, so common asks ("open
     notepad", "what's on my screen") run instantly without the LLM.
+    The "reply" key always contains the final text response.
     """
     shortcut = _try_shortcut(text, player)
     if shortcut is not None:
-        return shortcut
-    return _process_turn(text, player, conversation, brain_client)["reply"]
+        return {"reply": shortcut, "tool": None, "result": None, "steps": 0}
+    return _process_turn(text, player, conversation, brain_client)
 
 
 # ── History (command history persistence) ──────────────────────────────────
@@ -1262,6 +1522,8 @@ def _print_banner():
     print(f"{Style.CYAN}   The Ultimate Cross-Platform Personal AI Assistant{Style.RESET}")
     print(f"{Style.CYAN}   Type '{Style.BRIGHT_YELLOW}/help{Style.CYAN}' for commands, '{Style.BRIGHT_YELLOW}exit{Style.CYAN}' to quit{Style.RESET}")
     print(f"{Style.DIM}   ⚡ Try: 'open notepad' · 'search <q>' · 'play <song>' · \"what's on my screen\" · /tips{Style.RESET}")
+    print(f"{Style.DIM}   🧠 Multi-step agentic loop: Jeeves can chain tool calls automatically{Style.RESET}")
+    print(f"{Style.DIM}   🔒 Dangerous ops require your approval (shell, delete, restart){Style.RESET}")
     print(f"{Style.BRIGHT_CYAN}{'=' * 60}{Style.RESET}")
     print()
 
@@ -1320,9 +1582,12 @@ def _print_help():
     print(f"  {Style.BRIGHT_GREEN}/attach <path>{Style.RESET}  Attach a file for processing")
     print(f"  {Style.BRIGHT_GREEN}/mode{Style.RESET}           Show the current mode")
     print(f"  {Style.BRIGHT_GREEN}/chat{Style.RESET}           Switch to chat mode (from agent mode)")
+    print(f"  {Style.BRIGHT_GREEN}/approve{Style.RESET}        Auto-approve all tool calls for this session")
     print(f"  {Style.BRIGHT_GREEN}/exit{Style.RESET}           Exit the CLI")
     _print_shortcuts()
     print()
+    print(f"{Style.DIM}🧠 Agentic: Jeeves chains tool calls automatically (up to {AGENTIC_MAX_STEPS} steps){Style.RESET}")
+    print(f"{Style.DIM}🔒 Safety: dangerous ops (shell, delete, restart) ask before running{Style.RESET}")
     print(f"{Style.DIM}Multi-line input: end a line with \\ to continue on the next line{Style.RESET}")
     print(f"{Style.DIM}Tip: Just type naturally — Jeeves will call tools automatically{Style.RESET}")
     print(f"{Style.DIM}{'─' * 50}{Style.RESET}\n")
@@ -1392,8 +1657,39 @@ def _print_stats(conversation: list[dict]):
     print(f"{Style.DIM}{'─' * 40}{Style.RESET}\n")
 
 
-def _print_response(text: str):
-    """Print the assistant's response with styled formatting."""
+def _show_thinking(animate: bool = True) -> callable:
+    """Start a thinking animation; returns a stop function.
+
+    Shows a simple spinning indicator while the LLM is working.
+    Claude Code shows 'Thinking…' — we do the same with a minimal spinner.
+    """
+    if not animate or not sys.stdout.isatty() or _DAEMON_MODE:
+        return lambda: None
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    stop_event = threading.Event()
+    def _spin():
+        i = 0
+        while not stop_event.is_set():
+            sys.stdout.write(f"\r  {Style.CYAN}{frames[i % len(frames)]}{Style.RESET} {Style.DIM}Thinking...{Style.RESET}")
+            sys.stdout.flush()
+            i += 1
+            stop_event.wait(0.08)
+        sys.stdout.write("\r" + " " * 40 + "\r")
+        sys.stdout.flush()
+    t = threading.Thread(target=_spin, daemon=True)
+    t.start()
+    def _stop():
+        stop_event.set()
+        t.join(timeout=2.0)
+    return _stop
+
+
+def _print_response(text: str, meta: dict | None = None):
+    """Print the assistant's response with styled formatting.
+
+    When meta is provided (from _process_turn), shows token usage and
+    step count — like Claude Code's compact status footer.
+    """
     if not text:
         return
     # Simple markdown-like formatting
@@ -1401,7 +1697,23 @@ def _print_response(text: str):
     text = re.sub(r"\*(.+?)\*", f"{Style.ITALIC}\\1{Style.RESET}", text)
     text = re.sub(r"`(.+?)`", f"{Style.BRIGHT_GREEN}\\1{Style.RESET}", text)
 
-    print(f"\n{Style.BRIGHT_CYAN}🤖 Jeeves:{Style.RESET} {text}\n")
+    print(f"\n{Style.BRIGHT_CYAN}🤖 Jeeves:{Style.RESET} {text}")
+
+    # Compact status footer (Claude Code-style)
+    if meta and not _DAEMON_MODE:
+        parts = []
+        steps = meta.get("steps", 0)
+        if steps > 0:
+            tools_used = meta.get("tools_used", [])
+            if tools_used:
+                parts.append(f"{steps} tool call{'s' if steps > 1 else ''}")
+        tokens_in = _estimated_tokens_in
+        tokens_out = _estimated_tokens_out
+        if tokens_in or tokens_out:
+            parts.append(f"~{(tokens_in + tokens_out):,} tokens")
+        if parts:
+            print(f"{Style.DIM}   {' · '.join(parts)}{Style.RESET}")
+    print()  # trailing newline
 
 
 # ── REPL Loop ───────────────────────────────────────────────────────────────
@@ -1438,8 +1750,10 @@ def repl_loop(initial: str | None = None, start_mode: str = "chat"):
                 print(f"{Style.RED}Composio agent not available.{Style.RESET}")
             return
         else:
+            stop_thinking = _show_thinking()
             result = handle_text(initial, player, conversation, brain_client)
-            _print_response(result)
+            stop_thinking()
+            _print_response(result.get("reply", ""), result)
             return
 
     # Register cleanup handler (safe to call multiple times)
@@ -1522,6 +1836,15 @@ def repl_loop(initial: str | None = None, start_mode: str = "chat"):
 
             elif cmd == "mode":
                 print(f"{Style.CYAN}Current mode: {Style.BOLD}{current_mode}{Style.RESET}")
+
+            elif cmd == "approve":
+                # Toggle auto-approve mode for this session
+                global _AUTO_APPROVE
+                _AUTO_APPROVE = not getattr(sys.modules[__name__], '_AUTO_APPROVE', False)
+                if _AUTO_APPROVE:
+                    print(f"{Style.YELLOW}🔓 Auto-approve ON — all tool calls will run without confirmation.{Style.RESET}")
+                else:
+                    print(f"{Style.GREEN}🔒 Auto-approve OFF — dangerous tools will ask first.{Style.RESET}")
 
             elif cmd == "attach":
                 if cmd_arg:
@@ -1620,8 +1943,10 @@ def repl_loop(initial: str | None = None, start_mode: str = "chat"):
             continue
 
         # ── Normal chat mode ──
+        stop_thinking = _show_thinking()
         result = handle_text(text, player, conversation, brain_client)
-        _print_response(result)
+        stop_thinking()
+        _print_response(result.get("reply", ""), result)
 
         # Auto-save every 10 user messages
         user_count = sum(1 for m in conversation if m.get("role") == "user")
@@ -1649,11 +1974,27 @@ DAEMON_IDLE_TIMEOUT_S = 600.0
 _DAEMON_TOKEN_LOCK = threading.Lock()
 
 
+# Placeholder secrets shipped as defaults — a known public string is NOT
+# a secret. If the config still holds one, _daemon_token() regenerates a
+# real random token instead of silently authenticating with a guessable
+# value (the MCP servers that bind 0.0.0.0 share this key, so the fix
+# hardens them too).
+_KNOWN_PLACEHOLDER_SECRETS = {
+    "change_me_to_a_strong_secret",
+    "change_me_callback_secret",
+    "change_me",
+    "changeme",
+    "secret",
+    "password",
+}
+
+
 def _daemon_token() -> str:
     """Return the shared daemon auth token.
 
     Reuses `jeeves_api_secret` from config/api_keys.json (same trust domain
-    as the local web server). If missing, generates and persists one.
+    as the local web server). If missing OR still a known placeholder,
+    generates and persists a real random one.
     """
     with _DAEMON_TOKEN_LOCK:
         cfg_path = None
@@ -1663,7 +2004,7 @@ def _daemon_token() -> str:
         except Exception:
             cfg = {}
         token = str(cfg.get("jeeves_api_secret", "") or "").strip()
-        if not token:
+        if not token or token.strip().lower() in _KNOWN_PLACEHOLDER_SECRETS:
             token = secrets.token_hex(16)
             cfg["jeeves_api_secret"] = token
             if cfg_path is not None:
@@ -2273,6 +2614,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Auto-shutdown after SECONDS without requests (default: {int(DAEMON_IDLE_TIMEOUT_S)}; 0 = keep alive forever)",
     )
     parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        metavar="IP",
+        help="Interface to bind the daemon to (default: 127.0.0.1, or "
+             "config 'daemon_host'). Use 0.0.0.0 to allow remote clients "
+             "(phone/Termux) — the token still authenticates every request.",
+    )
+    parser.add_argument(
         "--daemon-stop",
         action="store_true",
         help="Send a shutdown request to a running daemon",
@@ -2335,7 +2685,15 @@ def main() -> None:
 
     # Daemon server mode
     if args.daemon:
-        sys.exit(_daemon_run(args.port, idle_timeout=args.idle_timeout))
+        host = args.host
+        if not host:
+            try:
+                host = str(json.loads(API_CONFIG_PATH.read_text(
+                    encoding="utf-8")).get("daemon_host") or "127.0.0.1")
+            except Exception:
+                host = "127.0.0.1"
+        sys.exit(_daemon_run(args.port, host=host,
+                             idle_timeout=args.idle_timeout))
 
     # Daemon admin
     if args.daemon_stop:

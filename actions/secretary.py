@@ -23,6 +23,222 @@ from pathlib import Path
 _CFG_PATH = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
 
 
+# ── Group-name heuristic (YinYang: safety net when the JS row filter misses)
+# WhatsApp groups often have names like "Family", "Work Group", "Class
+# 2025", "Chat" or end with ": N members" / "(5)".  Photo-less groups with
+# a single initial avatar pass the JS row filter as individual chats —
+# this name-based heuristic catches the most common patterns so the
+# secretary never replies to a group by accident.
+_GROUP_NAME_RE = re.compile(
+    r"(\bgroup\b|\bchat\b|\bteam\b|\bfamily\b|\bclass\b|\bforum\b|"
+    r"\bcommittee\b|\bsociety\b|\bclub\b|\bchurch\b|\bmosque\b|"
+    r"\bsquad\b|\bcrew\b|\bsupport\b|\bcommunity\b|\bboard\b|"
+    r"\bpanel\b|\bstaff\b|\bcouncil\b|\bteam\b|\bdevs\b|"
+    r"\bdevelopers\b|\bengineers\b|\bstudents\b|\bparents\b|"
+    r"\bneighbors\b|\bneighbours\b|\bassociates\b|\bmembers\b|"
+    r"\bassociates\b|\bassociates\b)"
+    r"|\(\d+\)"    # trailing (N) — e.g. "Family (5)"
+    r"|:\s*\d+"    # trailing ": N" — e.g. "Group: 12"
+    , re.IGNORECASE,
+)
+
+
+def _looks_like_group(sender: str) -> bool:
+    """True when the sender name looks like a group chat.
+
+    Catches the most common patterns that the JS row-level filter misses
+    (photo-less groups with a single initial avatar).  Used as a safety net
+    in handle_message — when the bridge send bypasses the subtitle check
+    (send_fn path), this catches groups by name before a reply is sent."""
+    s = (sender or "").strip()
+    if not s:
+        return False
+    return bool(_GROUP_NAME_RE.search(s))
+
+
+# ── Promise / follow-up detection ─────────────────────────────────────────────
+# A real secretary tracks when the boss promises to do something and
+# reminds them. These regexes catch the most common promise patterns in
+# English/Swahili/sheng so the secretary can extract and log them.
+_PROMISE_PATTERNS = [
+    # English promises
+    re.compile(r"i'?ll\s+(call|text|message|send|come|be|do|check|look|get|see|meet|reply|respond|follow|confirm|book|order|pay|bring|pick|drop|fix|handle|sort|arrange|plan|organize|reschedule|cancel|let you know|get back)", re.I),
+    re.compile(r"(?:can|will|shall|should|might|may|could)\s+(?:i|we)\s+(call|text|message|send|come|be|do|check|look|get|see|meet|reply|respond|follow|confirm|book|order|pay|bring|pick|drop|fix|handle|sort|arrange|plan|organize|reschedule|cancel)", re.I),
+    re.compile(r"(?:remind|reminder)\s+(?:me|us)\s+(?:to|about)", re.I),
+    re.compile(r"(?:i'?ll|we'?ll|let me)\s+(?:have|get|send|bring)\s+(?:it|them|that|this|one)", re.I),
+    re.compile(r"(?:tomorrow|next week|later today|tonight|this evening|monday|tuesday|wednesday|thursday|friday|saturday|sunday)", re.I),
+    # Swahili/sheng promises
+    re.compile(r"nit(?:a|afuatilie|atuma|leta|nunua|lipa|weka|fanya)", re.I),
+    re.compile(r"tuta(?:fanya|onana|piga|tembelea)", re.I),
+    re.compile(r"(?:nikumbushe|nikikumbushe)", re.I),
+]
+
+# Time expressions that indicate WHEN the promise should be fulfilled
+_TIME_EXPR_RE = re.compile(
+    r"(?:(?:in\s+)?\d+\s+(?:min(?:ute)?s?|hrs?|hours?|days?|weeks?|months?)"
+    r"|tomorrow|tonight|this\s+(?:evening|afternoon|morning|week|month)"
+    r"|next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|later\s+(?:today|this\s+week)"
+    r"|on\s+\d{1,2}[\/-]\d{1,2}"
+    r")", re.I,
+)
+
+
+def _detect_promises(message: str) -> list[dict]:
+    """Extract promises/follow-ups from a message.
+
+    Returns a list of {"text": str, "deadline": str|None} dicts.
+    A real secretary never misses 'I'll call you tomorrow' — these
+    are the boss's commitments that need tracking.
+    """
+    text = (message or "").strip()
+    if not text or len(text) > 500:
+        return []
+    promises = []
+    for pat in _PROMISE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            # Extract the surrounding context as the promise text
+            start = max(0, m.start() - 20)
+            end = min(len(text), m.end() + 40)
+            promise_text = text[start:end].strip()
+            # Try to find a time expression
+            deadline = None
+            tm = _TIME_EXPR_RE.search(text[m.start():])
+            if tm:
+                deadline = tm.group(0).strip()
+            promises.append({"text": promise_text, "deadline": deadline})
+            break  # one promise per message is enough
+    return promises
+
+
+def _add_followup(sender: str, promise: dict) -> None:
+    """Log a follow-up item for the boss."""
+    st = _state()
+    followups = st.setdefault("followups", [])
+    followups.append({
+        "from": sender,
+        "promise": promise.get("text", ""),
+        "deadline": promise.get("deadline"),
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "done": False,
+    })
+    # Keep bounded
+    if len(followups) > 100:
+        del followups[:-80]
+    _save_state(st)
+
+
+# ── Priority classification ───────────────────────────────────────────────────
+# A real secretary doesn't just escalate — they PRIORITIZE. The inbox is
+# sorted into tiers so the boss knows what to handle FIRST.
+
+# Priority: urgent (handle now), today (handle today), week (handle this week), fyi (informational)
+_URGENT_KEYWORDS = (
+    "urgent", "asap", "emergency", "immediately", "right now", "critical",
+    "deadline today", "overdue", "past due", "final notice", "last chance",
+    "expires today", "cancelled", "canceled", "terminated",
+)
+_TODAY_KEYWORDS = (
+    "today", "tonight", "this evening", "this afternoon", "this morning",
+    "in an hour", "in 2 hours", "soon", "now", "right away",
+)
+_WEEK_KEYWORDS = (
+    "this week", "next week", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "weekend", "next tuesday",
+)
+
+
+def _classify_priority(sender: str, message: str, escalation_reasons: list[str]) -> str:
+    """Classify an escalated message into a priority tier.
+
+    Returns: 'urgent', 'today', 'week', or 'fyi'.
+    A real secretary's triage is the difference between a productive day
+    and drowning in noise.
+    """
+    text = (message or "").lower()
+    reasons = [r.lower() for r in (escalation_reasons or [])]
+
+    # Urgent: money/legal/emergency keywords, or repeated unanswered contact
+    if any(k in text for k in _URGENT_KEYWORDS):
+        return "urgent"
+    if "urgency keywords" in " ".join(reasons):
+        return "urgent"
+    if "unanswered messages" in " ".join(reasons):
+        # 2+ unanswered → today, 5+ → urgent
+        m = re.search(r"(\d+) unanswered", " ".join(reasons))
+        if m and int(m.group(1)) >= 5:
+            return "urgent"
+        return "today"
+    if "needs the boss's decision" in " ".join(reasons):
+        return "today"
+    if "call" in " ".join(reasons):
+        return "today"
+
+    # Today: time-sensitive language
+    if any(k in text for k in _TODAY_KEYWORDS):
+        return "today"
+
+    # Week: scheduling, planning
+    if any(k in text for k in _WEEK_KEYWORDS):
+        return "week"
+
+    # Default: informational
+    return "fyi"
+
+
+# ── Contact CRM ───────────────────────────────────────────────────────────────
+# A real secretary remembers who each person is, their relationship to the
+# boss, and the context of recent interactions. This is the lightweight CRM.
+
+def _get_contact(sender: str) -> dict:
+    """Get the CRM record for a contact."""
+    st = _state()
+    contacts = st.setdefault("contacts", {})
+    key = (sender or "").strip().lower()
+    if key not in contacts:
+        contacts[key] = {
+            "name": sender,
+            "relationship": "",
+            "notes": "",
+            "last_interaction": "",
+            "message_count": 0,
+            "created": datetime.now().isoformat(timespec="seconds"),
+        }
+        _save_state(st)
+    return contacts[key]
+
+
+def _update_contact(sender: str, **kwargs) -> None:
+    """Update a contact's CRM record."""
+    st = _state()
+    contacts = st.setdefault("contacts", {})
+    key = (sender or "").strip().lower()
+    contact = contacts.get(key, _get_contact(sender))
+    for k, v in kwargs.items():
+        if v:  # only update non-empty values
+            contact[k] = v
+    contact["last_interaction"] = datetime.now().isoformat(timespec="seconds")
+    contact["message_count"] = contact.get("message_count", 0) + 1
+    contacts[key] = contact
+    _save_state(st)
+
+
+def _format_contact(sender: str) -> str:
+    """Format a contact's CRM record for display."""
+    c = _get_contact(sender)
+    lines = [f"📇 {c.get('name', sender)}:"]
+    if c.get("relationship"):
+        lines.append(f"  Relationship: {c['relationship']}")
+    if c.get("notes"):
+        lines.append(f"  Notes: {c['notes']}")
+    if c.get("last_interaction"):
+        lines.append(f"  Last seen: {c['last_interaction'][:16]}")
+    lines.append(f"  Messages handled: {c.get('message_count', 0)}")
+    return "\n".join(lines)
+
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 # _load_cfg() runs on every sweep and several times per handled message
 # (is_enabled, boss name, Meta-AI-drafts flag) — cache it keyed on
@@ -279,7 +495,7 @@ def _extract_vocative(messages, sender: str | None = None) -> str | None:
         m = (msg or "").strip()
         if not m:
             continue
-        tok = re.split(r"[\s,!:;?…—\-–]+", m, 1)[0].strip("'\"….!?")
+        tok = re.split(r"[\s,!:;?…—\-–]+", m, maxsplit=1)[0].strip("'\"….!?")
         t = tok.lower()
         if (2 <= len(t) <= 12 and t.isalpha() and t not in _PET_NAME_NOISE
                 and t not in _PET_STOPWORDS):
@@ -555,7 +771,14 @@ def _unanswered_count(sender: str) -> int:
 def triage(sender: str, message: str) -> dict:
     """Decide: reply automatically, or escalate to the boss.
 
-    Returns {"action": "reply"|"escalate", "reasons": [...], "draft": str}.
+    Returns {"action": "reply"|"escalate", "reasons": [...], "draft": str,
+             "priority": str, "promises": [...]}.
+
+    Priority tiers (like a real secretary's triage board):
+      urgent  — handle NOW (money/legal/emergency, 5+ unanswered)
+      today   — handle today (decisions, calls, time-sensitive)
+      week    — handle this week (scheduling, planning)
+      fyi     — informational (no action needed)
     """
     text = (message or "").lower()
     reasons: list[str] = []
@@ -569,9 +792,22 @@ def triage(sender: str, message: str) -> dict:
     if n >= 2:
         reasons.append(f"{n} unanswered messages from this sender")
 
+    # Detect promises/follow-ups the boss should track
+    promises = _detect_promises(message)
+
     if reasons:
-        return {"action": "escalate", "reasons": reasons[:3], "draft": draft}
-    return {"action": "reply", "reasons": [], "draft": draft}
+        priority = _classify_priority(sender, message, reasons)
+        return {"action": "escalate", "reasons": reasons[:3], "draft": draft,
+                "priority": priority, "promises": promises}
+    # Track promises even in routine replies — the boss may promise
+    # things in casual conversations too.
+    if promises:
+        for p in promises:
+            _add_followup(sender, p)
+    # Update contact CRM for every interaction
+    _update_contact(sender)
+    return {"action": "reply", "reasons": [], "draft": draft,
+            "priority": "fyi", "promises": promises}
 
 
 # ── Reply drafting (secretary voice, never over-commits) ─────────────────────
@@ -858,21 +1094,43 @@ def _log(sender: str, role: str, text: str) -> None:
     _save_state(st)
 
 
-def _escalate(sender: str, message: str, reasons: list[str], draft: str) -> str:
+def _escalate(sender: str, message: str, reasons: list[str], draft: str,
+             priority: str = "fyi", promises: list | None = None) -> str:
     st = _state()
     inbox = st.setdefault("inbox", [])
-    inbox.append({
+    entry = {
         "from": sender, "message": message, "reasons": reasons,
-        "draft": draft, "at": datetime.now().isoformat(timespec="seconds"),
-    })
+        "draft": draft, "priority": priority,
+        "at": datetime.now().isoformat(timespec="seconds"),
+    }
+    inbox.append(entry)
     _save_state(st)
-    return (
-        f"[ESCALATED to {_boss_name()}] from {sender}:\n"
+
+    # Track promises the boss made in this message
+    for p in (promises or []):
+        _add_followup(sender, p)
+
+    # Update the contact CRM
+    _update_contact(sender)
+
+    # Priority emoji for the escalation notice
+    prio_emoji = {"urgent": "🔴", "today": "🟡", "week": "🔵", "fyi": "⚪"}.get(priority, "⚪")
+    prio_label = priority.upper()
+
+    result = (
+        f"{prio_emoji} [{prio_label}] from {sender}:\n"
         f"  \"{message}\"\n"
         f"  why: {', '.join(reasons)}.\n"
         f"  suggested reply: {draft}\n"
         f"  → answer it with: secretary reply \"{sender}\" \"<your words>\""
     )
+    if promises:
+        p_text = promises[0].get("text", "")
+        deadline = promises[0].get("deadline", "")
+        result += f"\n  📝 Follow-up tracked: {p_text}"
+        if deadline:
+            result += f" (by {deadline})"
+    return result
 
 
 def _escalate_call(sender: str, kind: str, ringing: bool = False) -> str:
@@ -954,6 +1212,13 @@ def _session_overview() -> str:
         lines.append("  → 'secretary inbox' to review, 'secretary reply \"<name>\" \"<words>\"' to answer.")
     else:
         lines.append("  • No urgent messages waiting for you.")
+    # Delegated messages
+    forwarded = st.get("forwarded", []) or []
+    session_fwd = [f for f in forwarded if _since(f)]
+    if session_fwd:
+        lines.append(f"  • 🔀 Delegated ({len(session_fwd)}):")
+        for f in session_fwd[:5]:
+            lines.append(f"    - {f['from']} → {f['to']}: \"{f['message'][:50]}\"")
     return "\n".join(lines)
 
 
@@ -997,6 +1262,14 @@ def handle_message(sender: str, message: str, send: bool = True,
     if not sender or not message:
         return "Need both a sender and a message."
 
+    # daktari: the JS row filter misses photo-less groups (single avatar).
+    # The bridge send path via send_fn bypasses the subtitle group guard.
+    # This name-based heuristic catches the most common group patterns so
+    # the secretary NEVER replies to a group by accident.
+    if _looks_like_group(sender):
+        return (f"Skipping '{sender}' — looks like a group chat. The "
+                f"secretary only replies to individual contacts.")
+
     _log(sender, "incoming", message)
 
     # Media (photo/video/voice note/document/...) gets a reply that fits the
@@ -1010,8 +1283,27 @@ def handle_message(sender: str, message: str, send: bool = True,
 
     decision = triage(sender, message)
 
+    # ── Delegation: auto-forward to the right handler ──
+    # A real secretary doesn't just escalate to the boss — they route
+    # to the right person. If a delegation rule matches, forward the
+    # message to the handler AND acknowledge to the sender.
+    delegation_result = _auto_delegate(sender, message, send_fn=send_fn)
+    if delegation_result:
+        # Message was forwarded to the handler — still acknowledge to sender
+        draft = decision["draft"]
+        if send:
+            try:
+                _send_text(sender, draft, send_fn)
+                _log(sender, "outgoing", draft)
+            except Exception:
+                pass  # acknowledgment is best-effort
+        return (f"🔀 Delegated: {delegation_result}\n"
+                f"  📨 Acknowledgment sent to {sender}: {draft}")
+
     if decision["action"] == "escalate":
-        return _escalate(sender, message, decision["reasons"], decision["draft"])
+        return _escalate(sender, message, decision["reasons"], decision["draft"],
+                        priority=decision.get("priority", "fyi"),
+                        promises=decision.get("promises"))
 
     draft = decision["draft"]
     if media_kind:
@@ -1063,26 +1355,633 @@ def handle_message(sender: str, message: str, send: bool = True,
         return f"Drafted reply but sending failed: {e}\n  draft: {draft}"
 
 
+# ── Morning briefing ─────────────────────────────────────────────────────────
+def _morning_briefing() -> str:
+    """Generate a comprehensive morning briefing.
+
+    A real secretary starts the boss's day with everything they need:
+    calendar, email, inbox, follow-ups, and recent conversations.
+    Calendar and email are pulled from Composio when available;
+    the briefing degrades gracefully without them.
+    """
+    st = _state()
+    inbox = st.get("inbox", []) or []
+    followups = [f for f in (st.get("followups", []) or []) if not f.get("done")]
+    convs = st.get("conversations", {}) or {}
+    contacts = st.get("contacts", {}) or {}
+
+    lines = [f"☀️ Morning briefing for {_boss_name()}:"]
+    lines.append(f"  {datetime.now().strftime('%A, %B %d — %I:%M %p')}")
+
+    # ── Calendar (Composio Google Calendar) ──
+    if _composio_available():
+        try:
+            cal_result = _composio_task(
+                "List my calendar events for today. Show time and title. "
+                "If none, say 'No meetings today'. Keep it brief.",
+                timeout=20.0,
+            )
+            if cal_result and "no meetings" not in cal_result.lower():
+                lines.append(f"\n  📅 Calendar:")
+                for line in cal_result.splitlines()[:6]:
+                    lines.append(f"    {line.strip()}")
+            else:
+                lines.append("\n  📅 Calendar: no meetings today")
+        except Exception:
+            lines.append("\n  📅 Calendar: unavailable")
+    else:
+        lines.append("\n  📅 Calendar: not connected (run 'composio add googlecalendar')")
+
+    # ── Email (Composio Gmail) ──
+    if _composio_available():
+        try:
+            email_result = _composio_task(
+                "How many unread emails do I have? For each urgent/important "
+                "one, show sender and subject in one line. Skip newsletters. "
+                "If none urgent, just say the count.",
+                timeout=20.0,
+            )
+            if email_result:
+                lines.append(f"\n  📧 Email:")
+                for line in email_result.splitlines()[:6]:
+                    lines.append(f"    {line.strip()}")
+        except Exception:
+            lines.append("\n  📧 Email: unavailable")
+    else:
+        lines.append("\n  📧 Email: not connected (run 'composio add gmail')")
+
+    # ── Secretary inbox (WhatsApp messages) ──
+    if inbox:
+        urgent = [i for i in inbox if i.get("priority") == "urgent"]
+        today = [i for i in inbox if i.get("priority") == "today"]
+        week = [i for i in inbox if i.get("priority") == "week"]
+        fyi = [i for i in inbox if i.get("priority") == "fyi"]
+        lines.append(f"\n  📥 Messages: {len(inbox)} escalated item(s)")
+        if urgent:
+            lines.append(f"    🔴 {len(urgent)} URGENT — handle NOW:")
+            for i in urgent[:3]:
+                lines.append(f"       • {i['from']}: \"{i['message'][:60]}\"")
+        if today:
+            lines.append(f"    🟡 {len(today)} today:")
+            for i in today[:3]:
+                lines.append(f"       • {i['from']}: \"{i['message'][:60]}\"")
+        if week:
+            lines.append(f"    🔵 {len(week)} this week")
+        if fyi:
+            lines.append(f"    ⚪ {len(fyi)} informational")
+    else:
+        lines.append("\n  📥 Messages: clear 🎉")
+
+    # ── Follow-ups ──
+    if followups:
+        overdue = [f for f in followups if _is_overdue(f)]
+        lines.append(f"\n  📝 Follow-ups: {len(followups)} pending")
+        if overdue:
+            lines.append(f"    ⚠️ {len(overdue)} OVERDUE:")
+            for f in overdue[:3]:
+                lines.append(f"       • {f['from']}: \"{f['promise'][:50]}\"")
+        upcoming = [f for f in followups if not _is_overdue(f)][:3]
+        if upcoming:
+            lines.append(f"    Upcoming:")
+            for f in upcoming:
+                dl = f.get("deadline", "no deadline")
+                lines.append(f"       • {f['from']}: \"{f['promise'][:50]}\" (by {dl})")
+    else:
+        lines.append("\n  📝 Follow-ups: none pending")
+
+    # Recent conversations (last 24h)
+    recent_senders = []
+    cutoff = datetime.now().isoformat()[:10]  # today
+    for sender, entries in convs.items():
+        for e in reversed(entries):
+            at = str(e.get("at", ""))
+            if at[:10] >= cutoff and e.get("role") == "incoming":
+                recent_senders.append(sender)
+                break
+    if recent_senders:
+        lines.append(f"\n  💬 Messages from: {', '.join(recent_senders[:5])}")
+    else:
+        lines.append("\n  💬 No new messages today")
+
+    # Session stats
+    total_handled = sum(c.get("message_count", 0) for c in contacts.values())
+    delegations = len(st.get("delegation_rules", {}))
+    contact_count = len(contacts)
+    stats_parts = []
+    if total_handled:
+        stats_parts.append(f"{total_handled} messages handled")
+    if contact_count:
+        stats_parts.append(f"{contact_count} contacts tracked")
+    if delegations:
+        stats_parts.append(f"{delegations} delegation rules")
+    if stats_parts:
+        lines.append(f"\n  📊 Stats: {', '.join(stats_parts)}")
+
+    # Delegation rules summary
+    deleg_rules = st.get("delegation_rules", {})
+    if deleg_rules:
+        lines.append(f"\n  🔀 Delegation:")
+        for cat, handler in list(deleg_rules.items())[:3]:
+            lines.append(f"    • {cat} → {handler}")
+        if len(deleg_rules) > 3:
+            lines.append(f"    ... and {len(deleg_rules) - 3} more")
+
+    return "\n".join(lines)
+
+
+def _is_overdue(followup: dict) -> bool:
+    """Check if a follow-up is overdue based on its deadline."""
+    deadline = (followup.get("deadline") or "").lower()
+    if not deadline or deadline == "no deadline":
+        return False
+    # Simple checks
+    now = datetime.now()
+    if "yesterday" in deadline:
+        return True
+    if "today" in deadline:
+        return True
+    if "this morning" in deadline or "this afternoon" in deadline:
+        return True
+    return False
+
+
+# ── Proactive alerts ─────────────────────────────────────────────────────────
+def _proactive_alerts() -> str:
+    """Generate proactive alerts the boss needs to know about.
+
+    A real secretary doesn't wait to be asked — they proactively alert
+    the boss about overdue items, stale conversations, and pending
+    follow-ups.
+    """
+    alerts = []
+    st = _state()
+
+    # Overdue follow-ups
+    followups = [f for f in (st.get("followups", []) or []) if not f.get("done")]
+    overdue = [f for f in followups if _is_overdue(f)]
+    if overdue:
+        for f in overdue:
+            alerts.append(
+                f"⚠️ OVERDUE follow-up: {f['from']} — \"{f['promise'][:60]}\"\n"
+                f"   deadline was: {f.get('deadline', '?')}"
+            )
+
+    # Stale conversations (someone messaged 2+ days ago with no reply)
+    convs = st.get("conversations", {}) or {}
+    from datetime import timedelta
+    two_days_ago = (datetime.now() - timedelta(days=2)).isoformat()[:10]
+    for sender, entries in convs.items():
+        if not entries:
+            continue
+        last_incoming = None
+        last_outgoing = None
+        for e in reversed(entries):
+            if e.get("role") == "incoming" and not last_incoming:
+                last_incoming = e
+            if e.get("role") == "outgoing" and not last_outgoing:
+                last_outgoing = e
+        if (last_incoming and last_incoming.get("at", "")[:10] <= two_days_ago
+                and (not last_outgoing or last_outgoing.get("at", "")[:10] <= two_days_ago)):
+            alerts.append(
+                f"💤 Stale conversation: {sender} — last message "
+                f"{last_incoming.get('at', '?')[:10]}, no reply sent"
+            )
+
+    # Inbox overflow
+    inbox = st.get("inbox", []) or []
+    urgent_count = sum(1 for i in inbox if i.get("priority") == "urgent")
+    if urgent_count >= 3:
+        alerts.append(
+            f"🔴 Inbox overflow: {urgent_count} urgent items waiting!"
+        )
+
+    if not alerts:
+        return "✅ All clear — no proactive alerts. You're on top of things!"
+
+    return f"🔔 {len(alerts)} alert(s):\n\n" + "\n\n".join(alerts)
+
+
+# ── Calendar integration (via Composio Google Calendar) ────────────────────────
+# A real secretary manages the boss's calendar: checks today's meetings,
+# sends availability, blocks focus time, and reminds about upcoming events.
+
+def _composio_available() -> bool:
+    """True when the Composio agent is importable (Gmail/Calendar tools)."""
+    try:
+        from composio_agent import run_agentic_task
+        return True
+    except Exception:
+        return False
+
+
+def _composio_task(text: str, timeout: float = 30.0) -> str:
+    """Run a task through the Composio agent (Gmail, Calendar, GitHub).
+    Returns the result text, or an error string. Times out after `timeout`
+    seconds so the briefing never hangs."""
+    import threading as _threading
+    result_holder: dict = {"result": None, "error": None}
+    def _run():
+        try:
+            from composio_agent import run_agentic_task
+            result_holder["result"] = run_agentic_task(text) or "Done."
+        except Exception as e:
+            result_holder["error"] = f"Composio unavailable: {type(e).__name__}: {e}"
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        return "Composio timed out (try again later)"
+    return result_holder["error"] or result_holder["result"] or "Done."
+
+
+def _calendar_today() -> str:
+    """Get today's calendar events via Composio Google Calendar."""
+    if not _composio_available():
+        return ("Calendar not connected. Connect Google Calendar via Composio: "
+                "'composio add googlecalendar' in your terminal, or use "
+                "'secretary connect gmail/calendar' to open the setup.")
+    return _composio_task(
+        "List my calendar events for today. Show the time, title, and "
+        "location (if any) for each event. If no events, say so."
+    )
+
+
+def _calendar_tomorrow() -> str:
+    """Get tomorrow's calendar events."""
+    if not _composio_available():
+        return "Calendar not connected. Run 'composio add googlecalendar'."
+    return _composio_task(
+        "List my calendar events for tomorrow. Show time, title, location."
+    )
+
+
+def _calendar_week() -> str:
+    """Get this week's calendar overview."""
+    if not _composio_available():
+        return "Calendar not connected."
+    return _composio_task(
+        "List my calendar events for this week (Monday to Friday). "
+        "Group by day. Show time and title for each."
+    )
+
+
+def _calendar_next() -> str:
+    """Get the next upcoming meeting."""
+    if not _composio_available():
+        return "Calendar not connected."
+    return _composio_task(
+        "What is my next upcoming calendar event? Show the time, title, "
+        "who invited me, and any notes/description."
+    )
+
+
+def _calendar_free(text: str) -> str:
+    """Check availability for a proposed time."""
+    if not _composio_available():
+        return "Calendar not connected."
+    return _composio_task(
+        f"Check if I'm free at this time: {text}. "
+        "If free, say so. If busy, list what conflicts."
+    )
+
+
+def _calendar_schedule(text: str) -> str:
+    """Create a calendar event."""
+    if not _composio_available():
+        return "Calendar not connected."
+    return _composio_task(
+        f"Create a calendar event: {text}. "
+        "Confirm the event was created with time, title, and any attendees."
+    )
+
+
+# ── Email triage (via Composio Gmail) ────────────────────────────────────────
+# A real secretary applies the 4 D's to email: Delete, Do, Delegate, Defer.
+# They triage the inbox, surface urgent items, and draft replies.
+
+def _email_inbox() -> str:
+    """Get a summary of the inbox (unread emails)."""
+    if not _composio_available():
+        return ("Gmail not connected. Connect via Composio: "
+                "'composio add gmail' in your terminal.")
+    return _composio_task(
+        "List my unread emails. For each: who sent it, subject, and a "
+        "one-line summary. Group by priority: urgent/important first, "
+        "then newsletters/automated, then everything else."
+    )
+
+
+def _email_urgent() -> str:
+    """Get only urgent/important emails."""
+    if not _composio_available():
+        return "Gmail not connected."
+    return _composio_task(
+        "List only my URGENT or IMPORTANT unread emails. For each: "
+        "sender, subject, one-line summary, and whether it needs a "
+        "reply. Skip newsletters, automated messages, and promotions."
+    )
+
+
+def _email_draft(text: str) -> str:
+    """Draft a reply to an email."""
+    if not _composio_available():
+        return "Gmail not connected."
+    return _composio_task(
+        f"Draft a reply to this email request: {text}. "
+        "Write the draft in a professional but warm tone. "
+        "Show the draft and ask if it should be sent."
+    )
+
+
+def _email_summary() -> str:
+    """Get a full email summary for the morning briefing."""
+    if not _composio_available():
+        return "Gmail not connected."
+    return _composio_task(
+        "Summarize my email inbox: how many unread, who wrote, what about. "
+        "Flag any that need a reply today. Skip newsletters and automated."
+    )
+
+
+def _email_triage_report() -> str:
+    """Triage emails using the 4D framework."""
+    if not _composio_available():
+        return "Gmail not connected."
+    return _composio_task(
+        "Triage my unread emails using the 4D framework:\n"
+        "  DELETE: newsletters, spam, automated (list them)\n"
+        "  DO: quick replies under 2 minutes (list with suggested reply)\n"
+        "  DELEGATE: messages that should go to someone else (who?)\n"
+        "  DEFER: messages that need more time (when to follow up)\n"
+        "For each category, list the emails with sender, subject, and action."
+    )
+
+
+# ── Delegation system ─────────────────────────────────────────────────────────
+# A real secretary routes messages to the right person. This module tracks
+# who handles what, so the secretary can say 'forward this to X' or
+# 'cc the legal team'.
+
+def _delegation_list() -> str:
+    """Show delegation rules (who handles what)."""
+    st = _state()
+    rules = st.get("delegation_rules", {})
+    if not rules:
+        return ("No delegation rules set. Add some with:\n"
+                "  secretary delegate_add category='legal' handler='Lawyer Bob'\n"
+                "  secretary delegate_add category='finance' handler='Accountant Alice'")
+    lines = ["📋 Delegation rules:"]
+    for cat, handler in rules.items():
+        lines.append(f"  • {cat} → {handler}")
+    return "\n".join(lines)
+
+
+def _delegation_add(category: str, handler: str) -> str:
+    """Add a delegation rule."""
+    st = _state()
+    rules = st.setdefault("delegation_rules", {})
+    rules[category.lower().strip()] = handler.strip()
+    _save_state(st)
+    return f"✅ Delegation rule added: {category} → {handler}"
+
+
+def _delegation_remove(category: str) -> str:
+    """Remove a delegation rule."""
+    st = _state()
+    rules = st.get("delegation_rules", {})
+    key = category.lower().strip()
+    if key in rules:
+        removed = rules.pop(key)
+        _save_state(st)
+        return f"✅ Removed delegation rule: {category} → {removed}"
+    return f"No delegation rule found for '{category}'."
+
+
+def _delegation_check(message: str) -> str:
+    """Check if a message should be delegated based on rules."""
+    st = _state()
+    rules = st.get("delegation_rules", {})
+    if not rules:
+        return "No delegation rules configured."
+    text = (message or "").lower()
+    matches = []
+    for category, handler in rules.items():
+        if category in text:
+            matches.append((category, handler))
+    if matches:
+        cat, handler = matches[0]
+        return (f"🔀 This looks like it should be delegated:\n"
+                f"  Category: {cat}\n"
+                f"  Handler: {handler}\n"
+                f"  → Forward to {handler}? (secretary delegate_forward {handler})")
+    return "No delegation rule matched this message."
+
+
+def _delegation_match(message: str) -> tuple[str, str] | None:
+    """Return (category, handler) if the message matches a delegation rule,
+    else None. Used by the triage flow to auto-flag delegatable messages."""
+    st = _state()
+    rules = st.get("delegation_rules", {})
+    if not rules:
+        return None
+    text = (message or "").lower()
+    for category, handler in rules.items():
+        if category in text:
+            return (category, handler)
+    return None
+
+
+def _delegation_forward(handler: str, sender: str, message: str,
+                        send_fn=None) -> str:
+    """Forward a message to the delegated handler via WhatsApp.
+
+    The handler is a contact name (e.g. 'Lawyer Bob'). The message is
+    forwarded with context: who it's from, what it's about, and that it
+    was delegated by the boss's secretary.
+    """
+    handler = (handler or "").strip()
+    sender = (sender or "").strip()
+    message = (message or "").strip()
+    if not handler:
+        return "Need a handler name to forward to."
+    if not message:
+        return "Need a message to forward."
+
+    # Build the forwarded message with context
+    forwarded = (
+        f"📋 Delegated message from {_boss_name()}'s secretary:\n\n"
+        f"From: {sender}\n"
+        f"Message: {message}\n\n"
+        f"{_boss_name()} asked me to forward this to you for handling."
+    )
+
+    # Send via WhatsApp
+    try:
+        from actions.send_message import send_message
+        result = send_message({
+            "receiver": handler,
+            "message_text": forwarded,
+            "platform": "whatsapp",
+        }, player=None)
+    except Exception as e:
+        return f"Forward failed: {e}"
+
+    # Log the delegation
+    _log_delegation(sender, handler, message)
+
+    return (f"✅ Forwarded to {handler}:\n"
+            f"  From: {sender}\n"
+            f"  Message: {message[:80]}{'…' if len(message) > 80 else ''}\n"
+            f"  Result: {result}")
+
+
+def _log_delegation(sender: str, handler: str, message: str) -> None:
+    """Log a forwarded delegation for the session report."""
+    st = _state()
+    forwarded = st.setdefault("forwarded", [])
+    forwarded.append({
+        "from": sender,
+        "to": handler,
+        "message": message[:200],
+        "at": datetime.now().isoformat(timespec="seconds"),
+    })
+    # Keep bounded
+    if len(forwarded) > 100:
+        del forwarded[:-80]
+    _save_state(st)
+
+
+def _delegation_forwarded_list() -> str:
+    """Show recently forwarded messages."""
+    st = _state()
+    forwarded = st.get("forwarded", []) or []
+    if not forwarded:
+        return "No messages have been forwarded yet."
+    lines = [f"📤 {len(forwarded)} forwarded message(s):"]
+    for f in forwarded[-10:]:  # show last 10
+        lines.append(f"  • {f['from']} → {f['to']} ({f['at'][:16]})")
+        lines.append(f"    \"{f['message'][:60]}\"")
+    return "\n".join(lines)
+
+
+def _auto_delegate(sender: str, message: str, send_fn=None) -> str | None:
+    """Check if a message should be auto-forwarded to a delegated handler.
+
+    Returns the forwarding result string if auto-forwarded, else None.
+    This integrates with the triage flow so delegatable messages are
+    automatically routed to the right person.
+    """
+    match = _delegation_match(message)
+    if match is None:
+        return None
+    category, handler = match
+    # Auto-forward the message to the handler
+    result = _delegation_forward(handler, sender, message, send_fn=send_fn)
+    return result
+
+
+# ── Meeting prep ──────────────────────────────────────────────────────────────
+# A real secretary prepares briefs before meetings: who you're meeting,
+# recent context, talking points, action items from previous meetings.
+
+def _meeting_prep(text: str) -> str:
+    """Prepare a brief for an upcoming meeting.
+
+    Uses the boss's memory + CRM + recent conversations to build context
+    about who they're meeting and what to discuss.
+    """
+    parts = [f"📋 Meeting prep briefing:"]
+
+    # Who are we meeting?
+    from memory.memory_manager import load_memory
+    memory = load_memory()
+    contacts = _state().get("contacts", {})
+
+    # Check if we know this person
+    for key, contact in contacts.items():
+        name_lower = key.lower()
+        text_lower = (text or "").lower()
+        if name_lower in text_lower or name_lower in text_lower.split():
+            parts.append(f"\n📇 Contact info: {contact.get('name', key)}")
+            if contact.get("relationship"):
+                parts.append(f"  Relationship: {contact['relationship']}")
+            if contact.get("notes"):
+                parts.append(f"  Notes: {contact['notes']}")
+            parts.append(f"  Messages handled: {contact.get('message_count', 0)}")
+            # Recent conversations
+            convs = _state().get("conversations", {})
+            recent = convs.get(key, [])[-3:]
+            if recent:
+                parts.append(f"  Recent context:")
+                for e in recent:
+                    role = "them" if e.get("role") == "incoming" else "us"
+                    parts.append(f"    [{role}] {str(e.get('text', ''))[:80]}")
+            break
+    else:
+        parts.append(f"\nNo contact info found for '{text}'. "
+                     "Run 'secretary scan' or add a contact: "
+                     "'secretary contact \"Name\" relationship=... notes=...'")
+
+    # Check calendar for context
+    parts.append(f"\n📅 Calendar check: run 'secretary calendar' for today's schedule.")
+
+    # Suggested talking points
+    parts.append(f"\n💡 Suggested preparation:")
+    parts.append(f"  1. Review recent conversations with this person")
+    parts.append(f"  2. Check if they have any pending items in your inbox")
+    parts.append(f"  3. Prepare any documents they might need")
+
+    return "\n".join(parts)
+
+
+def _meeting_prep_calendar() -> str:
+    """Auto-prep for the next meeting by combining calendar + CRM + memory."""
+    if not _composio_available():
+        return _meeting_prep("next meeting")
+    # Get next meeting from calendar
+    cal_result = _composio_task(
+        "What is my next calendar event? Show the title, time, and "
+        "who invited me. Return ONLY the event info, nothing else."
+    )
+    # Build prep brief
+    brief = [f"📋 Auto meeting prep:", f"\n📅 Next meeting: {cal_result}"]
+    # Check contacts for the attendees
+    st = _state()
+    contacts = st.get("contacts", {})
+    for key, contact in contacts.items():
+        if key.lower() in cal_result.lower():
+            brief.append(f"\n📇 {contact.get('name', key)}:")
+            if contact.get("relationship"):
+                brief.append(f"  Relationship: {contact['relationship']}")
+            if contact.get("notes"):
+                brief.append(f"  Notes: {contact['notes']}")
+    brief.append(f"\n💡 Prepare: review recent conversations, check pending items")
+    return "\n".join(brief)
+
+
 # ── Tool entry point ──────────────────────────────────────────────────────────
 
 def secretary(parameters: dict, player=None, session_memory=None) -> str:
     """Tool dispatcher.
 
     Actions:
-      on / off / status        — toggle and query secretary mode (off ends
-                                 with a session report: who it talked to,
-                                 what it told them, calls seen, urgent items)
-      link                     — open the persistent WhatsApp window (scan
-                                 the QR once, stay connected forever)
-      link close               — close that window (monitoring stops too)
+      on / off / status        — toggle and query secretary mode
+      link / link close        — WhatsApp window management
       handle  sender, message  — process one incoming message
-      inbox                    — escalated items waiting for the boss
-      reply   sender, text     — send a personal reply as the boss
-      inbox_clear              — clear escalated items
-
-    While monitoring, the secretary also watches for incoming audio/video
-    calls (and missed calls in the chat list) — it can't pick up, so it
-    escalates them to the boss and logs them in the session report.
+      inbox                    — priority-sorted: 🔴 urgent → 🟡 today → 🔵 week → ⚪ fyi
+      snooze / done            — manage inbox items
+      reply   sender, text     — send a personal reply
+      followups / followup_done — track promises the boss made
+      briefing                 — morning summary: inbox + follow-ups + stats
+      alerts                   — proactive: overdue items, stale convos
+      contact [name]           — contact CRM
+      scan / report            — pet-name scan / session summary
+      calendar                 — today's meetings (via Composio Google Calendar)
+      calendar tomorrow/week/next/free/schedule — calendar operations
+      email                    — inbox summary (via Composio Gmail)
+      email urgent/draft/triage — email management with 4D framework
+      delegate_add/remove/list — delegation rules (who handles what)
+      meeting_prep [name]      — prepare brief for upcoming meeting
     """
     params = parameters or {}
     action = str(params.get("action", "status")).strip().lower()
@@ -1171,13 +2070,99 @@ def secretary(parameters: dict, player=None, session_memory=None) -> str:
         items = _state().get("inbox", [])
         if not items:
             return "Inbox is empty — nothing has been escalated."
+        # Priority-sorted display: urgent → today → week → fyi
+        priority_order = {"urgent": 0, "today": 1, "week": 2, "fyi": 3}
+        items_sorted = sorted(items,
+                             key=lambda it: priority_order.get(it.get("priority", "fyi"), 3))
+        prio_emoji = {"urgent": "🔴", "today": "🟡", "week": "🔵", "fyi": "⚪"}
         lines = [f"{len(items)} escalated item(s) for {_boss_name()}:"]
-        for i, it in enumerate(items, 1):
-            lines.append(f"\n{i}. From {it['from']} ({it['at'][:16]}): "
-                         f"\"{it['message']}\"")
-            lines.append(f"   why: {', '.join(it.get('reasons', []))}")
-            lines.append(f"   suggested: {it.get('draft', '')}")
+        current_prio = None
+        for i, it in enumerate(items_sorted, 1):
+            prio = it.get("priority", "fyi")
+            if prio != current_prio:
+                current_prio = prio
+                lines.append(f"\n  {prio_emoji.get(prio, '⚪')} {prio.upper()}:")
+            lines.append(f"    {i}. From {it['from']} ({it['at'][:16]}): "
+                         f"\"{it['message'][:80]}{'…' if len(it.get('message', '')) > 80 else ''}\"")
+            lines.append(f"       why: {', '.join(it.get('reasons', []))}")
+            lines.append(f"       suggested: {it.get('draft', '')[:60]}")
         return "\n".join(lines)
+    if action == "snooze":
+        # Snooze an inbox item (move it to 'later')
+        index = int(params.get("index", 0) or 0) - 1  # 1-based
+        items = _state().get("inbox", [])
+        if not items or index < 0 or index >= len(items):
+            return "Usage: secretary snooze <number> (from inbox list)"
+        item = items[index]
+        item["snoozed_until"] = datetime.now().isoformat(timespec="seconds")
+        item["priority"] = "week"  # demote to weekly
+        st = _state()
+        _save_state(st)
+        return f"Snoozed: {item['from']} — moved to weekly priority."
+    if action == "done":
+        # Mark an inbox item as handled
+        index = int(params.get("index", 0) or 0) - 1  # 1-based
+        items = _state().get("inbox", [])
+        if not items or index < 0 or index >= len(items):
+            return "Usage: secretary done <number> (from inbox list)"
+        removed = items.pop(index)
+        st = _state()
+        _save_state(st)
+        return f"✅ Done: removed '{removed['from']}' from inbox."
+    if action == "followups":
+        # Show pending follow-ups (promises the boss made)
+        followups = [f for f in _state().get("followups", [])
+                     if not f.get("done")]
+        if not followups:
+            return "No pending follow-ups — you're all caught up! 🎉"
+        lines = [f"📝 {len(followups)} pending follow-up(s):"]
+        for i, f in enumerate(followups, 1):
+            deadline = f.get("deadline", "no deadline")
+            lines.append(f"  {i}. {f['from']}: \"{f['promise']}\" (by {deadline})")
+            lines.append(f"     added: {f.get('created', '?')[:16]}")
+        return "\n".join(lines)
+    if action == "followup_done":
+        # Mark a follow-up as complete
+        index = int(params.get("index", 0) or 0) - 1
+        followups = _state().get("followups", [])
+        active = [f for f in followups if not f.get("done")]
+        if not active or index < 0 or index >= len(active):
+            return "Usage: secretary followup_done <number>"
+        active[index]["done"] = True
+        st = _state()
+        _save_state(st)
+        return f"✅ Follow-up marked done: {active[index]['promise'][:50]}"
+    if action == "briefing":
+        # Morning briefing: overnight messages + pending items + follow-ups
+        return _morning_briefing()
+    if action == "alerts":
+        # Proactive alerts: overdue follow-ups, stale conversations
+        return _proactive_alerts()
+    if action == "contact":
+        # Contact CRM: show or update a contact's info
+        contact_name = str(params.get("sender", "") or params.get("name", "")).strip()
+        if not contact_name:
+            # List all contacts
+            contacts = _state().get("contacts", {})
+            if not contacts:
+                return "No contacts tracked yet. Conversations will auto-populate."
+            lines = [f"📇 {len(contacts)} contact(s):"]
+            for key, c in sorted(contacts.items(),
+                                key=lambda x: x[1].get("last_interaction", ""),
+                                reverse=True):
+                rel = c.get("relationship", "") or "—"
+                notes = c.get("notes", "") or "—"
+                lines.append(f"  • {c.get('name', key)}: {rel} ({notes[:40]})")
+            return "\n".join(lines)
+        # Show/update a specific contact
+        relationship = str(params.get("relationship", "") or "").strip()
+        notes = str(params.get("notes", "") or "").strip()
+        if relationship or notes:
+            _update_contact(contact_name, relationship=relationship, notes=notes)
+            return f"📇 Updated contact: {contact_name}" + (
+                f" (relationship: {relationship})" if relationship else "") + (
+                f" (notes: {notes})" if notes else "")
+        return _format_contact(contact_name)
     if action == "reply":
         if not sender or not text:
             return "reply needs sender and text: secretary reply \"Mom\" \"yes, sounds good\""
@@ -1198,5 +2183,70 @@ def secretary(parameters: dict, player=None, session_memory=None) -> str:
     if action in ("inbox_clear", "clear"):
         _save_state({**_state(), "inbox": []})
         return "Escalated inbox cleared."
-    return ("Unknown action. Use: on, off, status, link, link close, handle, "
-            "inbox, reply, inbox_clear.")
+    # ── Calendar (Composio Google Calendar) ──
+    if action == "calendar":
+        sub = str(params.get("sub", "") or params.get("mode", "")).strip().lower()
+        if sub in ("tomorrow", "tmr"):
+            return _calendar_tomorrow()
+        if sub in ("week", "this week"):
+            return _calendar_week()
+        if sub in ("next", "upcoming"):
+            return _calendar_next()
+        if sub in ("free", "available", "availability"):
+            return _calendar_free(text or "now")
+        if sub in ("schedule", "create", "add", "book"):
+            return _calendar_schedule(text or "")
+        return _calendar_today()
+    # ── Email (Composio Gmail) ──
+    if action == "email":
+        sub = str(params.get("sub", "") or params.get("mode", "")).strip().lower()
+        if sub in ("urgent", "important"):
+            return _email_urgent()
+        if sub in ("draft", "reply", "write"):
+            return _email_draft(text or "")
+        if sub in ("triage", "sort", "4d"):
+            return _email_triage_report()
+        if sub in ("summary", "briefing"):
+            return _email_summary()
+        return _email_inbox()
+    # ── Delegation ──
+    if action == "delegate_list":
+        return _delegation_list()
+    if action == "delegate_add":
+        category = str(params.get("category", "") or "").strip()
+        handler = str(params.get("handler", "") or params.get("text", "")).strip()
+        if not category or not handler:
+            return "Usage: secretary delegate_add category='legal' handler='Lawyer Bob'"
+        return _delegation_add(category, handler)
+    if action == "delegate_remove":
+        category = str(params.get("category", "") or text or "").strip()
+        if not category:
+            return "Usage: secretary delegate_remove category='legal'"
+        return _delegation_remove(category)
+    if action == "delegate_check":
+        msg = str(params.get("message", "") or text or "").strip()
+        if not msg:
+            return "Usage: secretary delegate_check message='we need legal review'"
+        return _delegation_check(msg)
+    if action == "delegate_forward":
+        # Forward a message to a delegated handler
+        handler = str(params.get("handler", "") or params.get("text", "") or text or "").strip()
+        fwd_sender = str(params.get("sender", "") or "").strip()
+        fwd_message = str(params.get("message", "") or "").strip()
+        if not handler:
+            return "Usage: secretary delegate_forward handler='Lawyer Bob' sender='Mom' message='...'"
+        return _delegation_forward(handler, fwd_sender or "unknown", fwd_message or "(no message)")
+    if action in ("delegate_forwarded", "forwarded"):
+        return _delegation_forwarded_list()
+    # ── Meeting prep ──
+    if action in ("meeting_prep", "prep"):
+        meeting_text = str(params.get("meeting", "") or params.get("name", "") or text or "").strip()
+        sub = str(params.get("sub", "") or params.get("mode", "")).strip().lower()
+        if sub in ("auto", "next", "calendar"):
+            return _meeting_prep_calendar()
+        return _meeting_prep(meeting_text or "next meeting")
+    return ("Unknown action. Use: on | off | status | link | link close | "
+            "handle | inbox | snooze | done | reply | inbox_clear | "
+            "followups | followup_done | briefing | alerts | "
+            "contact | scan | report | calendar | email | "
+            "delegate_add/remove/list/check | meeting_prep.")

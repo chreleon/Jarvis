@@ -147,22 +147,27 @@ TOOL_DECLARATIONS = [
     {
         "name": "secretary",
         "description": (
-            "Secretary mode — Jeeves holds conversations on the user's "
-            "behalf when they're busy. Actions: on/off/status (toggle the "
-            "mode), link (open the persistent WhatsApp window to scan the QR "
-            "once — the session is saved and reused forever), link close, "
-            "handle (process one incoming message: sender + message), inbox "
-            "(escalated items needing the user's answer), reply (send a "
-            "personal reply as the user), inbox_clear. Routine messages get "
-            "an automatic polite reply; urgent/money/decision messages are "
-            "escalated to the user instead of auto-answered."
+            "Secretary mode — holds conversations, manages calendar/email, "
+            "tracks follow-ups, and maintains contact CRM. Actions: "
+            "on/off/status, inbox (priority-sorted), calendar (today/week/" 
+            "next/free/schedule), email (inbox/urgent/triage/draft), "
+            "delegate_add/remove/list, meeting_prep, followups, briefing, "
+            "alerts, contact CRM."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":  {"type": "STRING", "description": "on | off | status | link | link close | handle | inbox | reply | inbox_clear (default: status)"},
-                "sender":  {"type": "STRING", "description": "Who the message is from (for handle/reply)"},
-                "message": {"type": "STRING", "description": "The incoming message (for handle) or the reply text (for reply)"}
+                "action":  {"type": "STRING", "description": "on | off | status | link | link close | handle | inbox | snooze | done | reply | inbox_clear | followups | followup_done | briefing | alerts | contact | scan | report | calendar | email | delegate_add | delegate_remove | delegate_list | delegate_check | delegate_forward | delegate_forwarded | meeting_prep (default: status)"},
+                "sender":  {"type": "STRING", "description": "Who the message is from (for handle/reply/contact)"},
+                "message": {"type": "STRING", "description": "The incoming message (for handle) or the reply text (for reply)"},
+                "index":   {"type": "INTEGER", "description": "Item number from inbox/followups list (for snooze/done/followup_done)"},
+                "name":    {"type": "STRING", "description": "Contact name (for contact action)"},
+                "relationship": {"type": "STRING", "description": "Relationship to boss (for contact: e.g. 'wife', 'colleague')"},
+                "notes":   {"type": "STRING", "description": "Notes about the contact (for contact action)"},
+                "sub":     {"type": "STRING", "description": "Sub-action: tomorrow/week/next/free/schedule (calendar), urgent/draft/triage/summary (email), auto/next (meeting_prep)"},
+                "category": {"type": "STRING", "description": "Delegation category (for delegate_add/remove)"},
+                "handler": {"type": "STRING", "description": "Who handles this category (for delegate_add)"},
+                "meeting": {"type": "STRING", "description": "Meeting description or person name (for meeting_prep)"}
             },
             "required": ["action"]
         }
@@ -591,16 +596,18 @@ TOOL_DECLARATIONS = [
         "name": "phone_control",
         "description": (
             "Controls the user's Android phone through ADB over Wi-Fi: "
-            "status/connect (one-time USB setup, then cable-free), screen "
-            "(screenshot with optional vision analysis, tap, swipe, type, "
+            "status/connect (one-time USB setup, then cable-free), devices "
+            "(all connected phones), screen (LIVE mirror via scrcpy, or "
+            "screenshot with optional vision analysis, tap, swipe, type, "
             "key events), apps (list, launch, stop), files (browse, pull, "
-            "push), info (model, battery, storage) and safe shell commands. "
+            "push), info (model, battery, storage), diagnostics (logcat, "
+            "wifi, network, report, top, storage) and safe shell commands. "
             "Destructive actions are blocked."
         ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action": {"type": "STRING", "description": "status|connect|info|screenshot|tap|swipe|text|key|apps|launch|stop|files|pull|push|shell"},
+                "action": {"type": "STRING", "description": "status|devices|connect|info|screen|screenshot|logcat|wifi|network|report|top|storage|tap|swipe|text|key|apps|launch|stop|files|pull|push|shell"},
                 "x": {"type": "INTEGER", "description": "tap x (pixels)"},
                 "y": {"type": "INTEGER", "description": "tap y (pixels)"},
                 "x1": {"type": "INTEGER", "description": "swipe start x"},
@@ -617,7 +624,9 @@ TOOL_DECLARATIONS = [
                 "local": {"type": "STRING", "description": "path on the PC"},
                 "cmd": {"type": "STRING", "description": "safe shell command"},
                 "analyze": {"type": "BOOLEAN", "description": "screenshot: run vision analysis"},
-                "port": {"type": "INTEGER", "description": "wireless adb port (default 5555)"}
+                "port": {"type": "INTEGER", "description": "wireless adb port (default 5555)"},
+                "lines": {"type": "INTEGER", "description": "logcat: number of recent lines (default 120)"},
+                "limit": {"type": "INTEGER", "description": "top: max processes to show (default 15)"}
             },
             "required": ["action"]
         }
@@ -671,7 +680,7 @@ TOOL_REGISTRY = [
     {"name": "business_tracker", "description": "Tracks income/expenses locally; balance and monthly reports.",                       "usage": "business_tracker action='add' kind='income' amount=50 label='freelance'"},
     {"name": "daily_briefing",   "description": "One-command briefing: finances, monitors, reminders (+optional email).",            "usage": "daily_briefing"},
     {"name": "anime_watch",      "description": "New/trending anime with episodes, season, genre, status + Netflix flag.",         "usage": "anime_watch action='new'"},
-    {"name": "secretary",        "description": "Secretary mode: holds conversations for you; escalates urgent ones.",            "usage": "secretary action='handle' sender='Mom' message='dinner at 7?'"},
+    {"name": "secretary",        "description": "Secretary mode: holds conversations, priority inbox, follow-ups, CRM.",            "usage": "secretary action='inbox' (priority-sorted) | action='briefing' | action='followups' | action='contact'"},
     {"name": "weather_report",   "description": "Gets the weather forecast for a city.",                                                  "usage": "weather_report city='London'"},
     {"name": "send_message",     "description": "Sends a message via WhatsApp, Telegram, etc.",                                           "usage": "send_message receiver='John' message_text='Hi' platform='WhatsApp'"},
     {"name": "reminder",         "description": "Sets a timed reminder.",                                                                 "usage": "reminder date='2025-12-25' time='09:00' message='Christmas!'"},
