@@ -30,7 +30,17 @@ from composio_shim import ComposioToolSet, App
 
 
 logger = logging.getLogger("composio_agent")
-AGENT_MODEL = GROQ_DEFAULT_MODEL
+# Models that support native tool calling (tools= parameter) on Groq.
+# openai/gpt-oss-120b and openai/gpt-oss-20b do NOT support tool calling,
+# so we use models that do. Order: most capable first.
+AGENT_TOOL_MODELS = [
+    "qwen/qwen3-32b",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+AGENT_MODEL = AGENT_TOOL_MODELS[0]
 # Groq hard limit on the tools array: any request with more tools is rejected
 # with 400 "'tools' : maximum number of items is 128". Connected accounts can
 # expose far more (github alone fills a 200-tool page), so every agent call
@@ -77,6 +87,21 @@ _QUOTA_MARKERS = (
     "quota",
 )
 
+# Model doesn't support native tool calling — try the next candidate.
+_TOOL_CALLING_UNSUPPORTED_MARKERS = (
+    "no target in combo",
+    "supports tool calling",
+    "tool_choice",
+    "tools.*not supported",
+    "function_calling not supported",
+)
+
+
+def _is_tool_calling_error(exc: Exception) -> bool:
+    """True when the model rejected the tools= parameter (not tool-capable)."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _TOOL_CALLING_UNSUPPORTED_MARKERS)
+
 
 def _is_quota_error(exc: Exception) -> bool:
     """True for rate-limit / token-budget rejections (429, 413 "Request too
@@ -98,7 +123,7 @@ class _ModelExhausted(Exception):
 def _create_with_key_rotation(messages: list, tools: list,
                               model: str = AGENT_MODEL) -> Any:
     """Call Groq with the shared key pool; rotate keys on quota errors and
-    fall back to the lite model when the primary one is exhausted.
+    fall back to tool-capable models when the primary one is exhausted.
 
     A free-tier key has a 12k TPM budget, and a multi-turn agent loop burns
     the whole tools payload on every turn — one exhausted key must not fail
@@ -107,9 +132,9 @@ def _create_with_key_rotation(messages: list, tools: list,
     observed "tokens per day (TPD)" 429s), the lite model still answers, so
     this retries the whole call on it before giving up.
     """
-    models = [model]
-    if model != GROQ_LITE_MODEL:
-        models.append(GROQ_LITE_MODEL)
+    # Try tool-capable models in order; skip GROQ_LITE (gpt-oss-20b) since
+    # it doesn't support native tool calling either.
+    models = [model] + [m for m in AGENT_TOOL_MODELS if m != model]
     last_error: Exception | None = None
     for candidate in models:
         try:
@@ -118,10 +143,10 @@ def _create_with_key_rotation(messages: list, tools: list,
             last_error = exc.last_error
             logger.warning(
                 f"[ComposioAgent] {candidate} quota-exhausted on all keys "
-                f"({str(exc.last_error)[:120]}); trying lite model"
+                f"({str(exc.last_error)[:120]}); trying next tool-capable model"
             )
     raise last_error or RuntimeError(
-        "Composio agent: Groq quota exhausted on every model and key")
+        "Composio agent: all tool-capable models exhausted on every key")
 
 
 def _create_with_key_rotation_model(messages: list, tools: list,
@@ -151,6 +176,9 @@ def _create_with_key_rotation_model(messages: list, tools: list,
             )
         except Exception as exc:
             last_error = exc
+            # Model doesn't support tool calling — try next model, not next key.
+            if _is_tool_calling_error(exc):
+                raise _ModelExhausted(exc)
             if brain_client._is_payload_error(exc):
                 raise  # too big for the model — rotating keys can't fix it
             if not _is_quota_error(exc):

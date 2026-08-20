@@ -93,10 +93,9 @@ SESSION_DIR = BASE_DIR / "sessions"
 # Unbounded history + verbatim tool results pushed requests past the
 # free-tier per-minute token budget (413 "Payload Too Large" failures).
 # These caps keep every brain request small and cheap.
-HISTORY_WINDOW_TURNS = 10    # conversation turns sent to the brain
-MAX_MSG_CHARS        = 2500  # per-message cap inside the brain context
-MAX_HISTORY_CHARS    = 4000  # total cap for the trimmed conversation
-TOOL_RESULT_CHARS    = 1200  # tool results kept in history (rest is dropped)
+# Context budget constants imported from core.context (canonical source).
+# HISTORY_WINDOW_TURNS, MAX_MSG_CHARS, MAX_HISTORY_CHARS, TOOL_RESULT_CHARS
+# are now defined in core/context.py and imported at the top of this file.
 
 # ── Agentic loop settings (inspired by Claude Code) ──────────────────────
 # Claude Code chains multiple tool calls before responding. We replicate
@@ -303,6 +302,7 @@ def _get_brain_client():
 from config.tool_definitions import TOOL_REGISTRY, compact_tool_declarations
 from config.tool_tips import get_tool_tip, tool_tutorial
 from core.utils import parse_tool_call
+from core.context import trim_context, truncate_tool_result, HISTORY_WINDOW_TURNS, MAX_MSG_CHARS, MAX_HISTORY_CHARS, TOOL_RESULT_CHARS
 
 # ── Graceful Shutdown ─────────────────────────────────────────────────────
 _CLEANUP_REGISTERED = False
@@ -1183,27 +1183,9 @@ def _try_shortcut(text: str, player: ConsolePlayer) -> str | None:
     return None
 
 
-def _trim_context(messages: list[dict]) -> list[dict]:
-    """Cap per-message and total size of the conversation sent to the brain.
-
-    Long tool results / file / web outputs bloat a turn to thousands of
-    tokens; a few such turns push the request past the model's token
-    budget (413) and stall the whole pipeline. Trimming keeps requests
-    small. The newest message (the current utterance) is always kept.
-    """
-    trimmed: list[dict] = []
-    budget = MAX_HISTORY_CHARS
-    for m in reversed(messages):
-        content = m.get("content") or ""
-        if isinstance(content, str) and len(content) > MAX_MSG_CHARS:
-            # cap includes the ellipsis marker, so result <= MAX_MSG_CHARS
-            content = content[:MAX_MSG_CHARS - 1] + "…"
-        cost = len(content) + 64  # small overhead for role/structure
-        if trimmed and budget - cost < 0:
-            break
-        budget -= cost
-        trimmed.append({**m, "content": content})
-    return list(reversed(trimmed))
+# NOTE: _trim_context removed — use shared core.context.trim_context()
+# All call sites already use _trim_context() which now resolves to the
+# imported trim_context from core.context.
 
 
 # ── Conversation Handling ──────────────────────────────────────────────────

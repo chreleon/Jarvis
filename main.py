@@ -16,7 +16,8 @@ from memory.memory_manager import (
 from memory_cleanup import cleanup as cleanup_jeeves
 from config.tool_definitions import compact_tool_declarations
 from config.tool_tips import get_tool_tip, random_tip_entry
-from core.utils import get_provider_api_key, normalize_api_key
+from core.utils import get_provider_api_key, normalize_api_key, parse_tool_call
+from core.context import trim_context, truncate_tool_result, HISTORY_WINDOW_TURNS, MAX_MSG_CHARS, MAX_HISTORY_CHARS, TOOL_RESULT_CHARS
 
 # NOTE: action modules (file_processor, browser_control, composio_agent, ...)
 # are intentionally NOT imported at module level — they're loaded lazily via
@@ -72,13 +73,9 @@ TOOL_TIMEOUT_S         = 120  # any tool run_in_executor call
 # tool results were pushing requests to ~10.5k tokens, which blew past the
 # free-tier per-minute token budget and produced the endless 413 "Payload Too
 # Large" failures. These caps keep every request small and cheap.
-HISTORY_WINDOW_TURNS  = 10    # conversation turns sent to the brain
-MAX_MSG_CHARS         = 2500  # per-message cap inside the brain context
-MAX_HISTORY_CHARS     = 4000  # total cap for the trimmed conversation — sized so
-                              # that even the worst case (maxed memory + maxed
-                              # history) stays under the 6k-token per-minute
-                              # budget with the 2k output allowance
-TOOL_RESULT_CHARS     = 1200  # tool results kept in history (the rest is dropped)
+# Context budget constants imported from core.context (canonical source).
+# HISTORY_WINDOW_TURNS, MAX_MSG_CHARS, MAX_HISTORY_CHARS, TOOL_RESULT_CHARS
+# are now defined in core/context.py and imported at the top of this file.
 BRAIN_MAX_TOKENS      = 2048  # output cap for voice turns — replies are short,
                               # and a big reserved max_tokens counts against the
                               # per-minute budget even when unused
@@ -165,6 +162,7 @@ def _load_runtime_imports() -> dict:
         from actions.anime_watch import anime_watch
         from actions.secretary import secretary
         from actions.meta_ai import meta_ai
+        from actions.phone_control import phone_control
 
         from clap_listen import ClapListener
 
@@ -202,6 +200,7 @@ def _load_runtime_imports() -> dict:
             "anime_watch": anime_watch,
             "secretary": secretary,
             "meta_ai": meta_ai,
+            "phone_control": phone_control,
             # NOTE: run_agentic_task intentionally NOT bundled here — the
             # composio_agent module pulls in the full Composio SDK (~10s /
             # ~100MB cold). It's imported lazily inside _execute_tool only
@@ -269,6 +268,7 @@ class JeevesLive:
         self._seen_tool_tips: set[str] = set()  # first-use tool tips (like the CLI)
         self.ui.on_text_command = self._on_text_command
         self.ui.on_clap_toggle  = self._on_clap_toggle
+        self.ui.on_phone_command = self._on_phone_command
         self.ui.on_remote_clicked = self._make_remote_key
 
     def _on_text_command(self, text: str):
@@ -421,27 +421,10 @@ class JeevesLive:
 
         return "\n".join(parts)
 
+    # NOTE: _trim_context removed — use shared core.context.trim_context()
+    # Kept as alias for call sites that still reference self._trim_context.
     def _trim_context(self, messages: list[dict]) -> list[dict]:
-        """Cap per-message and total size of the conversation sent to the brain.
-
-        Long tool results / file / web outputs bloat a turn to thousands of
-        tokens; a few such turns push the request past the model's token
-        budget (413) and stall the whole pipeline. Trimming keeps requests
-        small. The newest message (the current utterance) is always kept.
-        """
-        trimmed: list[dict] = []
-        budget = MAX_HISTORY_CHARS
-        for m in reversed(messages):
-            content = m.get("content") or ""
-            if isinstance(content, str) and len(content) > MAX_MSG_CHARS:
-                # cap includes the ellipsis marker, so result <= MAX_MSG_CHARS
-                content = content[:MAX_MSG_CHARS - 1] + "…"
-            cost = len(content) + 64  # small overhead for role/structure
-            if trimmed and budget - cost < 0:
-                break
-            budget -= cost
-            trimmed.append({**m, "content": content})
-        return list(reversed(trimmed))
+        return trim_context(messages)
 
     async def _execute_tool(self, name: str, args: dict) -> str:
         args = dict(args or {})
@@ -450,6 +433,13 @@ class JeevesLive:
 
         print(f"[JEEVES] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
+        self.ui.set_active_tool(name)  # Light up the tool ring segment
+        # Update scrolling ticker with current tool
+        try:
+            self.ui.set_ticker(f"🔧 {name}  •  {json.dumps(args)[:80]}")
+        except Exception:
+            pass
+
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
@@ -627,6 +617,13 @@ class JeevesLive:
                 )
                 result = r or "Done."
 
+            elif name == "phone_control":
+                r = await loop.run_in_executor(
+                    None, lambda: imports["phone_control"](parameters=args,
+                                                            player=self.ui)
+                )
+                result = r or "Done."
+
             elif name == "shutdown_jeeves":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -652,6 +649,9 @@ class JeevesLive:
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
+
+        # Clear tool from active ring after execution
+        self.ui.clear_active_tool(name)
 
         print(f"[JEEVES] 📤 {name} → {str(result)[:80]}")
 
@@ -776,7 +776,7 @@ class JeevesLive:
 
         self.conversation.append({"role": "assistant", "content": reply})
 
-        tool_name, tool_args = self._parse_tool_call(reply)
+        tool_name, tool_args = parse_tool_call(reply)
 
         if tool_name:
             print(f"[JEEVES] 📞 {tool_name}")
@@ -838,29 +838,7 @@ class JeevesLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-    @staticmethod
-    def _parse_tool_call(reply: str):
-        cleaned = reply.strip()
-        if cleaned.startswith("```"):
-            parts = cleaned.split("```")
-            cleaned = parts[1] if len(parts) > 1 else cleaned
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
 
-        if not cleaned.startswith("{"):
-            return None, None
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            return None, None
-
-        call = data.get("tool_call")
-        if not call or not isinstance(call, dict):
-            return None, None
-
-        return call.get("name"), call.get("args", {})
 
     async def _play_audio(self):
         print("[JEEVES] 🔊 Play started")
@@ -909,6 +887,33 @@ class JeevesLive:
             if self._clap_listener is not None and self._clap_listener.is_running():
                 self._clap_listener.stop()
                 print("[JEEVES] Clap wake disabled.")
+
+    def _on_phone_command(self, action: str, params: dict | None = None):
+        """Phone-panel button → run phone_control directly (no LLM hop), so
+        the buttons work instantly and reliably, then log the outcome.
+        Runs in a worker thread — ADB calls are bounded and never block the
+        UI loop."""
+        params = dict(params or {})
+        params["action"] = action
+        label = action
+        if action == "launch" and params.get("pkg"):
+            label = f"launch {params['pkg']}"
+        self.ui.write_log(f"You: phone {label}")
+        self.ui.set_state("THINKING")
+
+        def _run():
+            try:
+                imports = _load_runtime_imports()
+                out = imports["phone_control"](parameters=params,
+                                                player=self.ui)
+                self.ui.write_log(f"Jeeves: {out}")
+            except Exception as e:
+                self.ui.write_log(f"ERR: phone {label} — {e}")
+            finally:
+                if not self.ui.muted:
+                    self.ui.set_state("LISTENING")
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _maybe_start_clap_listener(self):
         """Reads the saved config flag once at startup and starts the

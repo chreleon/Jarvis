@@ -93,8 +93,23 @@ _CHAT_ROWS = '#pane-side div[role="button"], #pane-side [role="row"]'
 _ROW_TITLES_JS = """
 () => Array.from(document.querySelectorAll('#pane-side div[role="button"], #pane-side [role="row"]')).map(r => {
   const t = r.querySelector('[data-testid="conversation-title"]')
-    || r.querySelector('span[title]') || r.querySelector('[title]');
-  return t ? (t.getAttribute('title') || t.textContent || '').trim() : '';
+    || r.querySelector('span[title]');
+  // daktari: the old fallback '[title]' was too broad — it matched ANY
+  // element with a title attribute, including message-preview tooltips
+  // ("with exactly ..."), turning random text into fake sender names.
+  // The span[title] fallback is tight enough: WhatsApp's chat titles are
+  // always in a span[title] when the testid is absent.
+  if (!t) return '';
+  const raw = (t.getAttribute('title') || t.textContent || '').trim();
+  // daktari: reject titles that look like sentence fragments (>40 chars,
+  // contain multiple spaces, end with punctuation typical of a preview,
+  // or start with a preposition like "with", "the", "and" — real
+  // contact names never start with these).
+  if (raw.length > 40 || /\s{3,}/.test(raw) || /[.!?]\s*$/.test(raw)) return '';
+  const low = raw.toLowerCase();
+  const preps = ['with ','the ','a ','an ','my ','your ','and ','but ','or ','in ','on ','at ','to ','for ','from ','by '];
+  if (preps.some(p => low.startsWith(p))) return '';
+  return raw;
 })
 """
 _QR_CANVAS = ('canvas[aria-label="Scan this QR code to link a device!"], '
@@ -265,6 +280,23 @@ def normalize_unread(data) -> list[dict]:
         title = str(d.get("title") or "").strip()
         if not title:
             continue
+        # daktari: reject titles that look like message-preview fragments
+        # ("with exactly ...", "I want to send you money on...") — the
+        # old [title] selector grabbed tooltip text as the chat name.
+        if len(title) > 40 or re.search(r"\s{3,}", title) or \
+                re.search(r"[.!?]\s*$", title):
+            continue
+        # Also reject titles starting with common prepositions/conjunctions
+        # — real contact names never start with "with", "the", "and", etc.
+        _PREPOSITIONS = (
+            "with ", "the ", "a ", "an ", "my ", "your ", "our ",
+            "and ", "but ", "or ", "in ", "on ", "at ", "to ",
+            "for ", "from ", "by ", "of ", "if ", "so ", "no ",
+            "is ", "it ", "he ", "she ", "we ", "they ",
+        )
+        low_t = title.lower()
+        if any(low_t.startswith(p) for p in _PREPOSITIONS):
+            continue
         preview = str(d.get("preview") or "").strip() or "(new message)"
         row = {"sender": title, "preview": preview,
                "time": str(d.get("time") or "").strip()}
@@ -376,12 +408,49 @@ class WhatsAppBridge:
 
         if self._pw is None:  # reuse a live driver on relaunch (window closed)
             self._pw = sync_playwright().start()
-        self._context = self._launch_context()
+        # daktari: a stale lock from a crashed/killed Chrome blocks the next
+        # launch.  Clean + retry with backoff so the OS has time to release
+        # file handles (Windows holds them longer than Linux after kill).
+        last_err = None
+        for attempt in range(4):
+            self._clean_stale_lock()
+            try:
+                self._context = self._launch_context()
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 3:
+                    time.sleep(2 * (attempt + 1))  # 2s, 4s, 6s backoff
+        else:
+            raise last_err  # type: ignore[misc]
         self._page = self._context.pages[0] if self._context.pages \
             else self._context.new_page()
         self._page.goto(_WHATSAPP_URL, wait_until="domcontentloaded",
                         timeout=30000)
         self._ready = True
+
+    @staticmethod
+    def _clean_stale_lock() -> None:
+        """Remove Chromium singleton lock files that survive a crash/kill.
+
+        When Chrome is force-killed (taskkill, Task Manager, BSOD), it never
+        gets to delete its SingletonLock/SingletonCookie/SingletonSocket files
+        or the Default/LOCK file.  The next launch sees the lock and crashes
+        with exit code 21 ("the profile is already in use").  This removes
+        those stale markers so a fresh browser can claim the profile.  The
+        files live at the root of user_data_dir and are safe to delete —
+        Chromium recreates them on startup."""
+        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+            try:
+                (PROFILE_DIR / name).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # Default/LOCK is Chromium's internal profile lock — also left
+        # behind after a force-kill.
+        try:
+            (PROFILE_DIR / "Default" / "LOCK").unlink(missing_ok=True)
+        except Exception:
+            pass
 
     def _launch_context(self):
         """Try the bundled Chromium first, then the user's installed Chrome

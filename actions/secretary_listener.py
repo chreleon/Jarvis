@@ -268,6 +268,7 @@ class SecretaryListener:
         pane gets re-filtered."""
         from actions.whatsapp_bridge import (acquire_shared_bridge,
                                              stop_all_bridges)
+        bridge = None
         try:
             # Drop every registry reference (bounded by the bridge _submit
             # timeout) so a fresh browser can take over the profile.
@@ -286,6 +287,12 @@ class SecretaryListener:
             self._filter_applied = False   # re-apply the Unread filter
             return bridge, True, True
         except Exception as e:
+            # Release the bridge if we acquired it but failed to start
+            if bridge is not None:
+                try:
+                    release_shared_bridge(bridge)
+                except Exception:
+                    pass
             self._last_error = f"bridge rebuild failed: {e}"
             print(f"[SecretaryListener] {self._last_error}", flush=True)
             return None, False, False
@@ -341,6 +348,23 @@ class SecretaryListener:
         from actions.secretary import _media_kind_of
         for fp, sender, preview, is_call in fresh:
             try:
+                # daktari: reject phantom senders — sentence-fragment titles
+                # ("with exactly ...") from tooltip text leak past the JS
+                # and normalize_unread guards.
+                slen = len(sender or '')
+                if slen > 40 or (slen > 0 and (
+                        sender.count(' ') >= 6
+                        or re.search(r'[.!?]\s*$', sender))):
+                    continue
+                # Also reject titles starting with prepositions/conjunctions
+                _PREPS = ('with ', 'the ', 'a ', 'an ', 'my ', 'your ',
+                          'and ', 'but ', 'or ', 'in ', 'on ', 'at ',
+                          'to ', 'for ', 'from ', 'by ', 'of ', 'if ',
+                          'so ', 'no ', 'is ', 'it ', 'he ', 'she ',
+                          'we ', 'they ')
+                sl = (sender or '').lower()
+                if any(sl.startswith(p) for p in _PREPS):
+                    continue
                 if is_call:
                     self._handle_call(sender, preview)
                 elif _media_kind_of(preview) == "skip":

