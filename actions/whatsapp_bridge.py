@@ -90,7 +90,7 @@ _SEARCH_INPUT = (
 _CHAT_ROWS = '#pane-side div[role="button"], #pane-side [role="row"]'
 
 # Titles of every chat row in DOM order ('' for section headers).
-_ROW_TITLES_JS = """
+_ROW_TITLES_JS = r"""
 () => Array.from(document.querySelectorAll('#pane-side div[role="button"], #pane-side [role="row"]')).map(r => {
   const t = r.querySelector('[data-testid="conversation-title"]')
     || r.querySelector('span[title]');
