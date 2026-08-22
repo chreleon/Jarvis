@@ -387,6 +387,7 @@ class SecretaryListener:
                 # isn't retried every poll (it already landed in the
                 # conversation log; the boss can still reply manually).
                 self._last_error = f"handling {sender}: {e}"
+                print(f"[SecretaryListener] {self._last_error}", flush=True)
         if fresh:
             try:
                 _mark_processed_many([fp for fp, _, _, _ in fresh])
