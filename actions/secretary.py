@@ -1289,14 +1289,19 @@ def handle_message(sender: str, message: str, send: bool = True,
     # message to the handler AND acknowledge to the sender.
     delegation_result = _auto_delegate(sender, message, send_fn=send_fn)
     if delegation_result:
-        # Message was forwarded to the handler — still acknowledge to sender
+        # Message was forwarded to the handler — still acknowledge to sender.
+        # The forward itself already happened, so a failed ack is reported
+        # honestly rather than silently claimed as sent (matches the other
+        # reply paths below).
         draft = decision["draft"]
         if send:
             try:
                 _send_text(sender, draft, send_fn)
                 _log(sender, "outgoing", draft)
-            except Exception:
-                pass  # acknowledgment is best-effort
+            except Exception as e:
+                return (f"🔀 Delegated: {delegation_result}\n"
+                        f"  ⚠️ Acknowledgment to {sender} failed: {e}\n"
+                        f"  ack: {draft}")
         return (f"🔀 Delegated: {delegation_result}\n"
                 f"  📨 Acknowledgment sent to {sender}: {draft}")
 
